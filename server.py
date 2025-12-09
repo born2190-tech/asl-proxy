@@ -91,6 +91,23 @@ async def aggregation(request: AggregationRequest, x_client_mac: str = Header(..
     if not BUSINESS_PLACE_ID:
         raise HTTPException(status_code=500, detail="BUSINESS_PLACE_ID not configured")
     
+    # --- РАСКОДИРУЕМ documentBody ---
+    try:
+        raw_json = base64.b64decode(request.documentBody.encode("utf-8")).decode("utf-8")
+        body_json = json.loads(raw_json)
+        print("[AGGREGATION] documentBody успешно раскодирован")
+    except Exception as e:
+        print(f"[AGGREGATION] ❌ Ошибка декодирования documentBody: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid documentBody: {e}")
+    
+    # --- ДОБАВЛЯЕМ businessPlaceId ВНУТРЬ JSON ---
+    body_json["businessPlaceId"] = BUSINESS_PLACE_ID
+    print(f"[AGGREGATION] Добавлен businessPlaceId={BUSINESS_PLACE_ID} в documentBody")
+    
+    # --- ПЕРЕкОДИРУЕМ ОБНОВЛЁННЫЙ JSON В BASE64 ---
+    new_raw_json = json.dumps(body_json, ensure_ascii=False, separators=(",", ":"))
+    new_document_body = base64.b64encode(new_raw_json.encode("utf-8")).decode("utf-8")
+    
     headers = {
         "Authorization": f"Bearer {ASL_API_KEY}",
         "X-Business-Place-Id": BUSINESS_PLACE_ID,
@@ -98,7 +115,7 @@ async def aggregation(request: AggregationRequest, x_client_mac: str = Header(..
     }
     
     payload = {
-        "documentBody": request.documentBody
+        "documentBody": new_document_body
     }
     
     try:
@@ -142,3 +159,4 @@ async def health():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
