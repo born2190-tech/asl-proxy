@@ -103,7 +103,7 @@ async def aggregation(request: AggregationRequest, x_client_mac: str = Header(..
         raise HTTPException(status_code=400, detail=f"Invalid documentBody: {e}")
     
     # --- ДОБАВЛЯЕМ businessPlaceId ВНУТРЬ JSON ---
-    body_json["businessPlaceId"] = BUSINESS_PLACE_ID
+    body_json["businessPlaceId"] = int(BUSINESS_PLACE_ID)
     print(f"[AGGREGATION] Добавлен businessPlaceId={BUSINESS_PLACE_ID} в documentBody")
     
     # --- ПЕРЕкОДИРУЕМ ОБНОВЛЁННЫЙ JSON В BASE64 ---
@@ -161,5 +161,6 @@ async def health():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
 
 
