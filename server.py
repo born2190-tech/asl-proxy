@@ -1,4 +1,6 @@
 import os
+import json
+import base64
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -159,4 +161,5 @@ async def health():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
 
