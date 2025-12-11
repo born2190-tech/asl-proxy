@@ -77,7 +77,7 @@ ensure_file_exists(AUTHORIZED_FILE, [])
 ensure_file_exists(PENDING_FILE, [])
 
 # ------------------------------------------------------------------
-# Telegram helper
+# Telegram helper (existing)
 # ------------------------------------------------------------------
 def send_telegram(message: str, buttons: List[List[Dict]] = None):
     """Send message to admin. buttons: inline_keyboard format"""
@@ -110,6 +110,91 @@ def answer_callback_query(callback_query_id: str, text: str = ""):
         requests.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=5)
     except Exception:
         traceback.print_exc()
+
+# ------------------------------------------------------------------
+# New Telegram admin helpers (for text commands)
+# ------------------------------------------------------------------
+def send_message_to_chat(chat_id: str, text: str):
+    if not BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        traceback.print_exc()
+
+async def handle_admin_command(chat_id: str, text: str):
+    """Processes admin text commands such as /list, /remove ..."""
+
+    text = (text or "").strip()
+    parts = text.split()
+    if not parts:
+        return
+
+    cmd = parts[0].lower()
+
+    # /help
+    if cmd == "/help":
+        send_message_to_chat(chat_id,
+            "<b>Admin Commands:</b>\n"
+            "/list – show authorized HWIDs\n"
+            "/pending – show pending HWIDs\n"
+            "/remove &lt;HWID&gt; – remove HWID from authorized\n"
+            "/clear_pending – clear pending list\n"
+        )
+        return
+
+    # /list
+    if cmd == "/list":
+        authorized = load_json(AUTHORIZED_FILE, [])
+        if not authorized:
+            send_message_to_chat(chat_id, "<b>Authorized list is empty.</b>")
+        else:
+            msg = "<b>Authorized HWIDs:</b>\n"
+            msg += "\n".join(f"- <code>{a}</code>" for a in authorized)
+            send_message_to_chat(chat_id, msg)
+        return
+
+    # /pending
+    if cmd == "/pending":
+        pending = load_json(PENDING_FILE, [])
+        if not pending:
+            send_message_to_chat(chat_id, "<b>Pending list is empty.</b>")
+        else:
+            msg = "<b>Pending HWIDs:</b>\n"
+            msg += "\n".join(f"- <code>{p}</code>" for p in pending)
+            send_message_to_chat(chat_id, msg)
+        return
+
+    # /clear_pending
+    if cmd == "/clear_pending":
+        save_json(PENDING_FILE, [])
+        send_message_to_chat(chat_id, "<b>Pending list cleared.</b>")
+        return
+
+    # /remove <HWID>
+    if cmd == "/remove":
+        if len(parts) < 2:
+            send_message_to_chat(chat_id, "Usage: /remove &lt;HWID&gt;")
+            return
+        hwid = parts[1].upper()
+
+        authorized = load_json(AUTHORIZED_FILE, [])
+        if hwid in authorized:
+            authorized.remove(hwid)
+            save_json(AUTHORIZED_FILE, authorized)
+            send_message_to_chat(chat_id, f"⛔ Removed: <code>{hwid}</code>")
+        else:
+            send_message_to_chat(chat_id, f"<b>HWID not in authorized:</b> <code>{hwid}</code>")
+        return
+
+    send_message_to_chat(chat_id, "Unknown command. Use /help.")
 
 # ------------------------------------------------------------------
 # Models
@@ -235,8 +320,10 @@ async def activate(request: ActivationRequest):
         raise HTTPException(status_code=500, detail="Signing failed")
 
     return {"authorized": True, "payload": payload_b64, "signature": signature_b64}
-    from pydantic import BaseModel
 
+# ------------------------------------------------------------------
+# /validate - strict validate + add to pending + notify
+# ------------------------------------------------------------------
 class ValidateRequest(BaseModel):
     hwid: str
 
@@ -270,7 +357,6 @@ async def validate(request: ValidateRequest):
 
     return {"authorized": False}
 
-
 # ------------------------------------------------------------------
 # Admin endpoints: view pending/authorized and approve via HTTP
 # ------------------------------------------------------------------
@@ -299,7 +385,7 @@ async def approve_hwid(hwid: str):
     return {"status": "ok", "approved": hw}
 
 # ------------------------------------------------------------------
-# Telegram webhook endpoint (GET to satisfy setWebhook test, POST to handle callbacks)
+# Telegram webhook endpoint (GET to satisfy setWebhook test, POST to handle callbacks + commands)
 # ------------------------------------------------------------------
 @app.get("/bot/{token}")
 async def bot_get(token: str):
@@ -322,52 +408,64 @@ async def bot_webhook(token: str, request: Request):
     except Exception:
         return {"ok": False, "error": "invalid json"}
 
-    # handle callback_query
-    if "callback_query" not in data:
+    # HANDLE TEXT MESSAGES (admin commands)
+    if "message" in data:
+        msg = data["message"]
+        chat_id = str(msg["chat"]["id"])
+        from_id = str(msg["from"]["id"])
+        text = msg.get("text", "")
+
+        # only admin can use commands
+        if str(ADMIN_ID) == from_id:
+            await handle_admin_command(chat_id, text)
+        else:
+            send_message_to_chat(chat_id, "You are not allowed to use admin commands.")
+
         return {"ok": True}
 
-    cq = data["callback_query"]
-    cq_id = cq.get("id")
-    cmd = cq.get("data", "")
-    from_user = cq.get("from", {})
-    chat_id = str(from_user.get("id", ""))
+    # HANDLE CALLBACK BUTTONS approve/deny
+    if "callback_query" in data:
+        cq = data["callback_query"]
+        cmd = cq.get("data", "")
+        cq_id = cq.get("id")
+        from_id = str(cq["from"]["id"])
 
-    # only admin may approve/deny via callbacks
-    if str(ADMIN_ID) and chat_id != str(ADMIN_ID):
-        # answer callback quietly
-        try:
+        # only admin
+        if str(ADMIN_ID) != from_id:
             answer_callback_query(cq_id, "Not authorized")
-        except:
-            pass
+            return {"ok": True}
+
+        if ":" not in cmd:
+            answer_callback_query(cq_id, "Unknown cmd")
+            return {"ok": True}
+
+        action, hwid = cmd.split(":", 1)
+        hw = hwid.strip().upper()
+
+        authorized = load_json(AUTHORIZED_FILE, [])
+        pending = load_json(PENDING_FILE, [])
+
+        if action == "approve":
+            if hw not in authorized:
+                authorized.append(hw)
+                save_json(AUTHORIZED_FILE, authorized)
+
+            if hw in pending:
+                pending.remove(hw)
+                save_json(PENDING_FILE, pending)
+
+            answer_callback_query(cq_id, "Approved")
+            send_telegram(f"✅ Approved:\n<code>{hw}</code>")
+
+        elif action == "deny":
+            if hw in pending:
+                pending.remove(hw)
+                save_json(PENDING_FILE, pending)
+
+            answer_callback_query(cq_id, "Denied")
+            send_telegram(f"⛔ Denied:\n<code>{hw}</code>")
+
         return {"ok": True}
-
-    if ":" not in cmd:
-        answer_callback_query(cq_id, "Unknown command")
-        return {"ok": True}
-
-    action, hwid = cmd.split(":", 1)
-    hw = hwid.strip().upper()
-
-    authorized = load_json(AUTHORIZED_FILE, [])
-    pending = load_json(PENDING_FILE, [])
-
-    if action == "approve":
-        if hw not in authorized:
-            authorized.append(hw)
-            save_json(AUTHORIZED_FILE, authorized)
-        if hw in pending:
-            pending.remove(hw)
-            save_json(PENDING_FILE, pending)
-        answer_callback_query(cq_id, "HWID approved")
-        send_telegram(f"✅ HWID разрешён:\n<code>{hw}</code>")
-    elif action == "deny":
-        if hw in pending:
-            pending.remove(hw)
-            save_json(PENDING_FILE, pending)
-        answer_callback_query(cq_id, "HWID denied")
-        send_telegram(f"⛔ HWID заблокирован:\n<code>{hw}</code>")
-    else:
-        answer_callback_query(cq_id, "Unknown action")
 
     return {"ok": True}
 
@@ -383,4 +481,3 @@ async def health():
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
-
