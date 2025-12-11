@@ -24,6 +24,8 @@ BUSINESS_PLACE_ID = os.getenv("BUSINESS_PLACE_ID")
 AUTHORIZED_MACS_URL = os.getenv("AUTHORIZED_MACS_URL")  # опционально
 AUTHORIZED_MACS = os.getenv("AUTHORIZED_MACS", "")  # список через запятую
 ASL_URL = "https://xtrace.aslbelgisi.uz/public/api/v1/doc/aggregation"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 
 class AggregationRequest(BaseModel):
@@ -205,6 +207,7 @@ async def activate(request: ActivationRequest):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
 
 
 
