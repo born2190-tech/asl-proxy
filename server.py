@@ -235,6 +235,41 @@ async def activate(request: ActivationRequest):
         raise HTTPException(status_code=500, detail="Signing failed")
 
     return {"authorized": True, "payload": payload_b64, "signature": signature_b64}
+    from pydantic import BaseModel
+
+class ValidateRequest(BaseModel):
+    hwid: str
+
+@app.post("/validate")
+async def validate(request: ValidateRequest):
+    """
+    Жёсткая проверка + автоподача заявки в Telegram если HWID не найден.
+    """
+    hwid = request.hwid.strip().upper()
+    print(f"[VALIDATE] Проверка HWID: {hwid}")
+
+    authorized = load_json(AUTHORIZED_FILE, [])
+    pending = load_json(PENDING_FILE, [])
+
+    # --- HWID РАЗРЕШЁН ---
+    if hwid in authorized:
+        return {"authorized": True}
+
+    # --- HWID НЕ РАЗРЕШЁН → создать pending и отправить TG-запрос ---
+    if hwid not in pending:
+        pending.append(hwid)
+        save_json(PENDING_FILE, pending)
+
+        # Telegram уведомление
+        buttons = [
+            [{"text": "Разрешить", "callback_data": f"approve:{hwid}"}],
+            [{"text": "Блокировать", "callback_data": f"deny:{hwid}"}]
+        ]
+        send_telegram(f"🛑 <b>Клиент потерял авторизацию или запрашивает доступ снова:</b>\n<code>{hwid}</code>",
+                      buttons)
+
+    return {"authorized": False}
+
 
 # ------------------------------------------------------------------
 # Admin endpoints: view pending/authorized and approve via HTTP
@@ -348,3 +383,4 @@ async def health():
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
+
