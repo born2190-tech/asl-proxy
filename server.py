@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import traceback
+import uuid
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -26,12 +27,13 @@ AUTHORIZED_MACS_URL = os.getenv("AUTHORIZED_MACS_URL")
 AUTHORIZED_MACS = os.getenv("AUTHORIZED_MACS", "")
 ASL_URL = "https://xtrace.aslbelgisi.uz/public/api/v1/doc/aggregation"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Telegram bot token
-ADMIN_ID = os.getenv("ADMIN_ID")    # Telegram admin chat id (as string or number)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 # Files for HWID lists
 AUTHORIZED_FILE = os.getenv("AUTHORIZED_FILE", "authorized_hwids.json")
 PENDING_FILE = os.getenv("PENDING_FILE", "pending_hwids.json")
+MAPPING_FILE = os.getenv("MAPPING_FILE", "hwid_mapping.json")  # short_id -> full_hwid
 
 # ------------------------------------------------------------------
 # FastAPI init
@@ -75,24 +77,46 @@ def save_json(path: str, data):
 # ensure files exist on startup
 ensure_file_exists(AUTHORIZED_FILE, [])
 ensure_file_exists(PENDING_FILE, [])
+ensure_file_exists(MAPPING_FILE, {})
 
 # ------------------------------------------------------------------
-# Helper: short HWID for Telegram buttons (first 12 chars)
+# HWID Mapping: short_id <-> full_hwid (SECURE)
 # ------------------------------------------------------------------
-def short_hwid(hwid: str) -> str:
-    """Returns first 12 characters of HWID for display/buttons"""
+def generate_short_id() -> str:
+    """Generates unique 8-character ID for Telegram buttons"""
+    return str(uuid.uuid4())[:8].upper()
+
+def get_or_create_short_id(hwid: str) -> str:
+    """Gets existing short_id or creates new one for HWID"""
+    mapping = load_json(MAPPING_FILE, {})
+    
+    # Check if this HWID already has a short_id
+    for short_id, full_hwid in mapping.items():
+        if full_hwid == hwid:
+            return short_id
+    
+    # Create new short_id
+    short_id = generate_short_id()
+    
+    # Ensure uniqueness
+    while short_id in mapping:
+        short_id = generate_short_id()
+    
+    mapping[short_id] = hwid
+    save_json(MAPPING_FILE, mapping)
+    return short_id
+
+def get_hwid_from_short_id(short_id: str) -> str:
+    """Gets full HWID from short_id"""
+    mapping = load_json(MAPPING_FILE, {})
+    return mapping.get(short_id, "")
+
+def short_hwid_display(hwid: str) -> str:
+    """Returns first 12 characters for display only"""
     return hwid[:12].upper()
 
-def find_hwid_by_short(short: str, hwid_list: List[str]) -> str:
-    """Finds full HWID from list by matching first 12 chars"""
-    short_upper = short.upper()
-    for hwid in hwid_list:
-        if hwid.upper().startswith(short_upper):
-            return hwid.upper()
-    return ""
-
 # ------------------------------------------------------------------
-# Telegram helper (fixed for short HWID)
+# Telegram helper
 # ------------------------------------------------------------------
 def send_telegram(message: str, buttons: List[List[Dict]] = None):
     """Send message to admin. buttons: inline_keyboard format"""
@@ -113,10 +137,11 @@ def send_telegram(message: str, buttons: List[List[Dict]] = None):
         r = requests.post(url, json=payload, timeout=6)
         if r.status_code != 200:
             print("[TG] send failed:", r.status_code, r.text)
+        else:
+            print("[TG] sent successfully")
     except Exception:
         traceback.print_exc()
 
-# small helper to answer callback queries
 def answer_callback_query(callback_query_id: str, text: str = ""):
     if not BOT_TOKEN:
         return
@@ -127,7 +152,7 @@ def answer_callback_query(callback_query_id: str, text: str = ""):
         traceback.print_exc()
 
 # ------------------------------------------------------------------
-# New Telegram admin helpers (for text commands)
+# Telegram admin helpers
 # ------------------------------------------------------------------
 def send_message_to_chat(chat_id: str, text: str):
     if not BOT_TOKEN:
@@ -145,8 +170,7 @@ def send_message_to_chat(chat_id: str, text: str):
         traceback.print_exc()
 
 async def handle_admin_command(chat_id: str, text: str):
-    """Processes admin text commands such as /list, /remove ..."""
-
+    """Processes admin text commands"""
     text = (text or "").strip()
     parts = text.split()
     if not parts:
@@ -154,61 +178,65 @@ async def handle_admin_command(chat_id: str, text: str):
 
     cmd = parts[0].lower()
 
-    # /help
     if cmd == "/help":
         send_message_to_chat(chat_id,
             "<b>Admin Commands:</b>\n"
             "/list – show authorized HWIDs\n"
             "/pending – show pending HWIDs\n"
-            "/remove &lt;HWID_short&gt; – remove HWID from authorized\n"
+            "/remove &lt;HWID_short&gt; – remove HWID\n"
             "/clear_pending – clear pending list\n"
         )
         return
 
-    # /list
     if cmd == "/list":
         authorized = load_json(AUTHORIZED_FILE, [])
         if not authorized:
             send_message_to_chat(chat_id, "<b>Authorized list is empty.</b>")
         else:
             msg = "<b>Authorized HWIDs:</b>\n"
-            msg += "\n".join(f"- <code>{short_hwid(a)}</code>... ({a})" for a in authorized)
+            for a in authorized:
+                short_display = short_hwid_display(a)
+                msg += f"- <code>{short_display}</code>...\n"
             send_message_to_chat(chat_id, msg)
         return
 
-    # /pending
     if cmd == "/pending":
         pending = load_json(PENDING_FILE, [])
         if not pending:
             send_message_to_chat(chat_id, "<b>Pending list is empty.</b>")
         else:
             msg = "<b>Pending HWIDs:</b>\n"
-            msg += "\n".join(f"- <code>{short_hwid(p)}</code>... ({p})" for p in pending)
+            for p in pending:
+                short_display = short_hwid_display(p)
+                msg += f"- <code>{short_display}</code>...\n"
             send_message_to_chat(chat_id, msg)
         return
 
-    # /clear_pending
     if cmd == "/clear_pending":
         save_json(PENDING_FILE, [])
         send_message_to_chat(chat_id, "<b>Pending list cleared.</b>")
         return
 
-    # /remove <HWID_short>
     if cmd == "/remove":
         if len(parts) < 2:
-            send_message_to_chat(chat_id, "Usage: /remove &lt;HWID_short&gt;")
+            send_message_to_chat(chat_id, "Usage: /remove &lt;HWID_prefix&gt;")
             return
-        hwid_short = parts[1].upper()
-
-        authorized = load_json(AUTHORIZED_FILE, [])
-        full_hwid = find_hwid_by_short(hwid_short, authorized)
+        prefix = parts[1].upper()
         
-        if full_hwid:
-            authorized.remove(full_hwid)
+        authorized = load_json(AUTHORIZED_FILE, [])
+        found = None
+        for hwid in authorized:
+            if hwid.upper().startswith(prefix):
+                found = hwid
+                break
+        
+        if found:
+            authorized.remove(found)
             save_json(AUTHORIZED_FILE, authorized)
-            send_message_to_chat(chat_id, f"⛔ Removed: <code>{short_hwid(full_hwid)}</code>...")
+            short_display = short_hwid_display(found)
+            send_message_to_chat(chat_id, f"⛔ Removed: <code>{short_display}</code>...")
         else:
-            send_message_to_chat(chat_id, f"<b>HWID not found:</b> <code>{hwid_short}</code>")
+            send_message_to_chat(chat_id, f"<b>HWID not found with prefix:</b> <code>{prefix}</code>")
         return
 
     send_message_to_chat(chat_id, "Unknown command. Use /help.")
@@ -231,7 +259,7 @@ class AuthCheckResponse(BaseModel):
     message: str
 
 # ------------------------------------------------------------------
-# MAC check logic (kept for backwards compatibility)
+# MAC check logic
 # ------------------------------------------------------------------
 def check_mac_authorization(mac: str) -> bool:
     try:
@@ -250,7 +278,7 @@ def check_mac_authorization(mac: str) -> bool:
         return False
 
 # ------------------------------------------------------------------
-# /aggregation endpoint (unchanged)
+# /aggregation endpoint
 # ------------------------------------------------------------------
 @app.post("/aggregation", response_model=AggregationResponse)
 async def aggregation(request: AggregationRequest, x_client_mac: str = Header(...)):
@@ -282,7 +310,7 @@ async def aggregation(request: AggregationRequest, x_client_mac: str = Header(..
     return AggregationResponse(status_code=r.status_code, body=body)
 
 # ------------------------------------------------------------------
-# /check-auth (unchanged)
+# /check-auth
 # ------------------------------------------------------------------
 @app.get("/check-auth")
 async def check_auth(x_client_mac: str = Header(...)):
@@ -290,7 +318,7 @@ async def check_auth(x_client_mac: str = Header(...)):
     return AuthCheckResponse(authorized=authorized, message="Authorized" if authorized else "Not authorized")
 
 # ------------------------------------------------------------------
-# /activate - issue signed license if HWID authorized, otherwise pending
+# /activate - SECURE VERSION with unique short IDs
 # ------------------------------------------------------------------
 @app.post("/activate")
 async def activate(request: ActivationRequest):
@@ -306,15 +334,20 @@ async def activate(request: ActivationRequest):
             pending.append(hwid)
             save_json(PENDING_FILE, pending)
 
-        # USE SHORT HWID IN BUTTONS (Telegram limit: 64 bytes)
-        short = short_hwid(hwid)
+        # Generate SECURE short ID (8 characters, unique)
+        short_id = get_or_create_short_id(hwid)
+        short_display = short_hwid_display(hwid)
+        
+        # callback_data is now just 8 characters + "approve:" = 16 bytes total
         buttons = [
-            [{"text": "✅ Разрешить", "callback_data": f"approve:{short}"}],
-            [{"text": "⛔ Блокировать", "callback_data": f"deny:{short}"}]
+            [{"text": "✅ Разрешить", "callback_data": f"approve:{short_id}"}],
+            [{"text": "⛔ Блокировать", "callback_data": f"deny:{short_id}"}]
         ]
+        
         send_telegram(
             f"🔐 <b>Новый HWID запросил доступ:</b>\n"
-            f"<code>{short}</code>...\n\n"
+            f"<code>{short_display}</code>...\n\n"
+            f"<b>ID:</b> <code>{short_id}</code>\n"
             f"<i>Полный HWID: {hwid}</i>",
             buttons
         )
@@ -346,40 +379,38 @@ async def activate(request: ActivationRequest):
     return {"authorized": True, "payload": payload_b64, "signature": signature_b64}
 
 # ------------------------------------------------------------------
-# /validate - strict validate + add to pending + notify
+# /validate
 # ------------------------------------------------------------------
 class ValidateRequest(BaseModel):
     hwid: str
 
 @app.post("/validate")
 async def validate(request: ValidateRequest):
-    """
-    Жёсткая проверка + автоподача заявки в Telegram если HWID не найден.
-    """
     hwid = request.hwid.strip().upper()
     print(f"[VALIDATE] Проверка HWID: {hwid}")
 
     authorized = load_json(AUTHORIZED_FILE, [])
     pending = load_json(PENDING_FILE, [])
 
-    # --- HWID РАЗРЕШЁН ---
     if hwid in authorized:
         return {"authorized": True}
 
-    # --- HWID НЕ РАЗРЕШЁН → создать pending и отправить TG-запрос ---
     if hwid not in pending:
         pending.append(hwid)
         save_json(PENDING_FILE, pending)
 
-        # Telegram уведомление с SHORT HWID
-        short = short_hwid(hwid)
+        short_id = get_or_create_short_id(hwid)
+        short_display = short_hwid_display(hwid)
+        
         buttons = [
-            [{"text": "✅ Разрешить", "callback_data": f"approve:{short}"}],
-            [{"text": "⛔ Блокировать", "callback_data": f"deny:{short}"}]
+            [{"text": "✅ Разрешить", "callback_data": f"approve:{short_id}"}],
+            [{"text": "⛔ Блокировать", "callback_data": f"deny:{short_id}"}]
         ]
+        
         send_telegram(
-            f"🛑 <b>Клиент потерял авторизацию или запрашивает доступ снова:</b>\n"
-            f"<code>{short}</code>...\n\n"
+            f"🛑 <b>Клиент потерял авторизацию:</b>\n"
+            f"<code>{short_display}</code>...\n\n"
+            f"<b>ID:</b> <code>{short_id}</code>\n"
             f"<i>Полный HWID: {hwid}</i>",
             buttons
         )
@@ -387,7 +418,7 @@ async def validate(request: ValidateRequest):
     return {"authorized": False}
 
 # ------------------------------------------------------------------
-# Admin endpoints: view pending/authorized and approve via HTTP
+# Admin endpoints
 # ------------------------------------------------------------------
 @app.get("/pending-hwids")
 async def get_pending_hwids():
@@ -401,24 +432,31 @@ async def get_authorized_hwids():
 
 @app.post("/approve/{hwid_or_short}")
 async def approve_hwid(hwid_or_short: str):
-    """Approve by full HWID or short (first 12 chars)"""
-    hw_input = hwid_or_short.strip().upper()
+    """Approve by full HWID, short display (12 chars), or short_id (8 chars)"""
+    input_val = hwid_or_short.strip().upper()
     
     auth = load_json(AUTHORIZED_FILE, [])
     pending = load_json(PENDING_FILE, [])
     
-    # Check if it's a short HWID - find full version
-    if len(hw_input) <= 12:
-        # Search in pending first
-        full_hwid = find_hwid_by_short(hw_input, pending)
-        if not full_hwid:
-            # Search in authorized
-            full_hwid = find_hwid_by_short(hw_input, auth)
-        if not full_hwid:
+    # Try as short_id first (8 chars from mapping)
+    if len(input_val) == 8:
+        full_hwid = get_hwid_from_short_id(input_val)
+        if full_hwid:
+            hw = full_hwid
+        else:
+            raise HTTPException(status_code=404, detail="Short ID not found")
+    # Try as prefix match
+    elif len(input_val) < 64:
+        found = None
+        for hwid in pending + auth:
+            if hwid.upper().startswith(input_val):
+                found = hwid
+                break
+        if not found:
             raise HTTPException(status_code=404, detail="HWID not found")
-        hw = full_hwid
+        hw = found
     else:
-        hw = hw_input
+        hw = input_val
     
     if hw not in auth:
         auth.append(hw)
@@ -428,41 +466,34 @@ async def approve_hwid(hwid_or_short: str):
         pending.remove(hw)
         save_json(PENDING_FILE, pending)
     
-    send_telegram(f"✅ HWID разрешён:\n<code>{short_hwid(hw)}</code>...")
+    short_display = short_hwid_display(hw)
+    send_telegram(f"✅ HWID разрешён:\n<code>{short_display}</code>...")
     return {"status": "ok", "approved": hw}
 
 # ------------------------------------------------------------------
-# Telegram webhook endpoint (GET to satisfy setWebhook test, POST to handle callbacks + commands)
+# Telegram webhook
 # ------------------------------------------------------------------
 @app.get("/bot/{token}")
 async def bot_get(token: str):
-    # Simple test endpoint - returns OK so setWebhook doesn't get 404
     return {"ok": True, "token": token}
 
 @app.post("/bot/{token}")
 async def bot_webhook(token: str, request: Request):
-    # first: quick token check
-    if not BOT_TOKEN:
-        return {"ok": False, "error": "bot token not configured"}
-
-    if token != BOT_TOKEN:
-        # token mismatch - ignore
+    if not BOT_TOKEN or token != BOT_TOKEN:
         return {"ok": False, "error": "token mismatch"}
 
-    # parse incoming update
     try:
         data = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
 
-    # HANDLE TEXT MESSAGES (admin commands)
+    # HANDLE TEXT MESSAGES
     if "message" in data:
         msg = data["message"]
         chat_id = str(msg["chat"]["id"])
         from_id = str(msg["from"]["id"])
         text = msg.get("text", "")
 
-        # only admin can use commands
         if str(ADMIN_ID) == from_id:
             await handle_admin_command(chat_id, text)
         else:
@@ -470,14 +501,13 @@ async def bot_webhook(token: str, request: Request):
 
         return {"ok": True}
 
-    # HANDLE CALLBACK BUTTONS approve/deny (with SHORT HWID)
+    # HANDLE CALLBACK BUTTONS - using secure short_id mapping
     if "callback_query" in data:
         cq = data["callback_query"]
         cmd = cq.get("data", "")
         cq_id = cq.get("id")
         from_id = str(cq["from"]["id"])
 
-        # only admin
         if str(ADMIN_ID) != from_id:
             answer_callback_query(cq_id, "Not authorized")
             return {"ok": True}
@@ -486,21 +516,19 @@ async def bot_webhook(token: str, request: Request):
             answer_callback_query(cq_id, "Unknown cmd")
             return {"ok": True}
 
-        action, hwid_short = cmd.split(":", 1)
+        action, short_id = cmd.split(":", 1)
+        
+        # Get full HWID from secure mapping
+        hwid = get_hwid_from_short_id(short_id)
+        
+        if not hwid:
+            answer_callback_query(cq_id, "ID not found")
+            return {"ok": True}
         
         authorized = load_json(AUTHORIZED_FILE, [])
         pending = load_json(PENDING_FILE, [])
         
-        # Find full HWID from short
-        full_hwid = find_hwid_by_short(hwid_short, pending)
-        if not full_hwid:
-            full_hwid = find_hwid_by_short(hwid_short, authorized)
-        
-        if not full_hwid:
-            answer_callback_query(cq_id, "HWID not found")
-            return {"ok": True}
-        
-        hw = full_hwid.upper()
+        hw = hwid.upper()
 
         if action == "approve":
             if hw not in authorized:
@@ -512,7 +540,8 @@ async def bot_webhook(token: str, request: Request):
                 save_json(PENDING_FILE, pending)
 
             answer_callback_query(cq_id, "Approved")
-            send_telegram(f"✅ Approved:\n<code>{short_hwid(hw)}</code>...")
+            short_display = short_hwid_display(hw)
+            send_telegram(f"✅ Approved:\n<code>{short_display}</code>...")
 
         elif action == "deny":
             if hw in pending:
@@ -520,7 +549,8 @@ async def bot_webhook(token: str, request: Request):
                 save_json(PENDING_FILE, pending)
 
             answer_callback_query(cq_id, "Denied")
-            send_telegram(f"⛔ Denied:\n<code>{short_hwid(hw)}</code>...")
+            short_display = short_hwid_display(hw)
+            send_telegram(f"⛔ Denied:\n<code>{short_display}</code>...")
 
         return {"ok": True}
 
