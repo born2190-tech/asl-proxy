@@ -157,10 +157,55 @@ async def check_auth(x_client_mac: str = Header(...)):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+from Crypto.Signature import pkcs1_15
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
+
+class ActivationRequest(BaseModel):
+    hwid: str
+
+@app.post("/activate")
+async def activate(request: ActivationRequest):
+    hwid = request.hwid.strip().upper()
+
+    print(f"[ACTIVATE] Запрос активации для HWID: {hwid}")
+
+    private_key_pem = os.getenv("RSA_PRIVATE_KEY")
+    if not private_key_pem:
+        raise HTTPException(status_code=500, detail="RSA_PRIVATE_KEY not configured")
+
+    try:
+        private_key = RSA.import_key(private_key_pem)
+    except Exception as e:
+        print(f"[ACTIVATE] Ошибка импорта RSA ключа: {e}")
+        raise HTTPException(status_code=500, detail="Invalid RSA key")
+
+    # payload — данные лицензии, которые будут проверяться на клиенте
+    payload_json = {
+        "hwid": hwid,
+        "valid": True,
+        "exp": "2030-01-01"       # можно убрать или изменить
+    }
+    payload_str = json.dumps(payload_json, separators=(",", ":"))
+    payload_b64 = base64.b64encode(payload_str.encode()).decode()
+
+    # Подписываем RSA-SHA256
+    h = SHA256.new(payload_str.encode())
+    signature = pkcs1_15.new(private_key).sign(h)
+    signature_b64 = base64.b64encode(signature).decode()
+
+    print("[ACTIVATE] Подпись сформирована успешно")
+
+    return {
+        "payload": payload_b64,
+        "signature": signature_b64
+    }
+
 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
 
 
 
