@@ -16,6 +16,11 @@ from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 
+# PostgreSQL
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
+
 # ------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------
@@ -30,10 +35,284 @@ ASL_URL = "https://xtrace.aslbelgisi.uz/public/api/v1/doc/aggregation"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
-# Files for HWID lists
-AUTHORIZED_FILE = os.getenv("AUTHORIZED_FILE", "authorized_hwids.json")
-PENDING_FILE = os.getenv("PENDING_FILE", "pending_hwids.json")
-MAPPING_FILE = os.getenv("MAPPING_FILE", "hwid_mapping.json")  # short_id -> full_hwid
+# PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ------------------------------------------------------------------
+# PostgreSQL Connection Pool
+# ------------------------------------------------------------------
+db_pool = None
+
+def init_db_pool():
+    """Initialize PostgreSQL connection pool"""
+    global db_pool
+    if not DATABASE_URL:
+        print("[DB] WARNING: DATABASE_URL not set!")
+        return
+    
+    try:
+        db_pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=DATABASE_URL
+        )
+        print("[DB] Connection pool created")
+        init_tables()
+    except Exception as e:
+        print(f"[DB] Failed to create pool: {e}")
+        traceback.print_exc()
+
+def get_db_connection():
+    """Get connection from pool"""
+    if not db_pool:
+        raise Exception("Database pool not initialized")
+    return db_pool.getconn()
+
+def return_db_connection(conn):
+    """Return connection to pool"""
+    if db_pool:
+        db_pool.putconn(conn)
+
+def init_tables():
+    """Create tables if they don't exist"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Table: authorized_hwids
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS authorized_hwids (
+                hwid VARCHAR(255) PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_validated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Table: pending_hwids
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_hwids (
+                hwid VARCHAR(255) PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Table: hwid_mapping (short_id -> full_hwid)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hwid_mapping (
+                short_id VARCHAR(8) PRIMARY KEY,
+                full_hwid VARCHAR(255) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        conn.commit()
+        print("[DB] Tables initialized")
+        
+    except Exception as e:
+        print(f"[DB] Failed to init tables: {e}")
+        traceback.print_exc()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ------------------------------------------------------------------
+# Database operations
+# ------------------------------------------------------------------
+
+def db_get_authorized() -> List[str]:
+    """Get all authorized HWIDs"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT hwid FROM authorized_hwids")
+        rows = cursor.fetchall()
+        return [row[0] for row in rows]
+    except Exception as e:
+        print(f"[DB] Error getting authorized: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_get_pending() -> List[str]:
+    """Get all pending HWIDs"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT hwid FROM pending_hwids")
+        rows = cursor.fetchall()
+        return [row[0] for row in rows]
+    except Exception as e:
+        print(f"[DB] Error getting pending: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_add_authorized(hwid: str):
+    """Add HWID to authorized list"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO authorized_hwids (hwid) VALUES (%s) ON CONFLICT (hwid) DO NOTHING",
+            (hwid,)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error adding authorized: {e}")
+        traceback.print_exc()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_remove_authorized(hwid: str):
+    """Remove HWID from authorized list"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM authorized_hwids WHERE hwid = %s", (hwid,))
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error removing authorized: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_add_pending(hwid: str):
+    """Add HWID to pending list"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO pending_hwids (hwid) VALUES (%s) ON CONFLICT (hwid) DO NOTHING",
+            (hwid,)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error adding pending: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_remove_pending(hwid: str):
+    """Remove HWID from pending list"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pending_hwids WHERE hwid = %s", (hwid,))
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error removing pending: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_clear_pending():
+    """Clear all pending HWIDs"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pending_hwids")
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error clearing pending: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_update_last_validated(hwid: str):
+    """Update last_validated timestamp"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE authorized_hwids SET last_validated = CURRENT_TIMESTAMP WHERE hwid = %s",
+            (hwid,)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error updating last_validated: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ------------------------------------------------------------------
+# HWID Mapping: short_id <-> full_hwid (SECURE)
+# ------------------------------------------------------------------
+def generate_short_id() -> str:
+    """Generates unique 8-character ID for Telegram buttons"""
+    return str(uuid.uuid4())[:8].upper()
+
+def get_or_create_short_id(hwid: str) -> str:
+    """Gets existing short_id or creates new one for HWID"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if mapping exists
+        cursor.execute("SELECT short_id FROM hwid_mapping WHERE full_hwid = %s", (hwid,))
+        row = cursor.fetchone()
+        
+        if row:
+            return row[0]
+        
+        # Create new short_id
+        short_id = generate_short_id()
+        
+        # Ensure uniqueness
+        while True:
+            cursor.execute("SELECT 1 FROM hwid_mapping WHERE short_id = %s", (short_id,))
+            if not cursor.fetchone():
+                break
+            short_id = generate_short_id()
+        
+        # Insert mapping
+        cursor.execute(
+            "INSERT INTO hwid_mapping (short_id, full_hwid) VALUES (%s, %s)",
+            (short_id, hwid)
+        )
+        conn.commit()
+        
+        return short_id
+        
+    except Exception as e:
+        print(f"[DB] Error in get_or_create_short_id: {e}")
+        traceback.print_exc()
+        return generate_short_id()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_hwid_from_short_id(short_id: str) -> str:
+    """Gets full HWID from short_id"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT full_hwid FROM hwid_mapping WHERE short_id = %s", (short_id,))
+        row = cursor.fetchone()
+        return row[0] if row else ""
+    except Exception as e:
+        print(f"[DB] Error getting hwid from short_id: {e}")
+        return ""
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def short_hwid_display(hwid: str) -> str:
+    """Returns first 12 characters for display only"""
+    return hwid[:12].upper()
 
 # ------------------------------------------------------------------
 # FastAPI init
@@ -47,73 +326,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------
-# Utilities: JSON file load/save (robust)
-# ------------------------------------------------------------------
-def ensure_file_exists(path: str, default):
-    if not os.path.exists(path):
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(default, f, indent=2, ensure_ascii=False)
-        except Exception:
-            traceback.print_exc()
-
-def load_json(path: str, default):
-    ensure_file_exists(path, default)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        traceback.print_exc()
-        return default
-
-def save_json(path: str, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception:
-        traceback.print_exc()
-
-# ensure files exist on startup
-ensure_file_exists(AUTHORIZED_FILE, [])
-ensure_file_exists(PENDING_FILE, [])
-ensure_file_exists(MAPPING_FILE, {})
-
-# ------------------------------------------------------------------
-# HWID Mapping: short_id <-> full_hwid (SECURE)
-# ------------------------------------------------------------------
-def generate_short_id() -> str:
-    """Generates unique 8-character ID for Telegram buttons"""
-    return str(uuid.uuid4())[:8].upper()
-
-def get_or_create_short_id(hwid: str) -> str:
-    """Gets existing short_id or creates new one for HWID"""
-    mapping = load_json(MAPPING_FILE, {})
-    
-    # Check if this HWID already has a short_id
-    for short_id, full_hwid in mapping.items():
-        if full_hwid == hwid:
-            return short_id
-    
-    # Create new short_id
-    short_id = generate_short_id()
-    
-    # Ensure uniqueness
-    while short_id in mapping:
-        short_id = generate_short_id()
-    
-    mapping[short_id] = hwid
-    save_json(MAPPING_FILE, mapping)
-    return short_id
-
-def get_hwid_from_short_id(short_id: str) -> str:
-    """Gets full HWID from short_id"""
-    mapping = load_json(MAPPING_FILE, {})
-    return mapping.get(short_id, "")
-
-def short_hwid_display(hwid: str) -> str:
-    """Returns first 12 characters for display only"""
-    return hwid[:12].upper()
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db_pool()
 
 # ------------------------------------------------------------------
 # Telegram helper
@@ -189,7 +405,7 @@ async def handle_admin_command(chat_id: str, text: str):
         return
 
     if cmd == "/list":
-        authorized = load_json(AUTHORIZED_FILE, [])
+        authorized = db_get_authorized()
         if not authorized:
             send_message_to_chat(chat_id, "<b>Authorized list is empty.</b>")
         else:
@@ -201,7 +417,7 @@ async def handle_admin_command(chat_id: str, text: str):
         return
 
     if cmd == "/pending":
-        pending = load_json(PENDING_FILE, [])
+        pending = db_get_pending()
         if not pending:
             send_message_to_chat(chat_id, "<b>Pending list is empty.</b>")
         else:
@@ -213,7 +429,7 @@ async def handle_admin_command(chat_id: str, text: str):
         return
 
     if cmd == "/clear_pending":
-        save_json(PENDING_FILE, [])
+        db_clear_pending()
         send_message_to_chat(chat_id, "<b>Pending list cleared.</b>")
         return
 
@@ -223,7 +439,7 @@ async def handle_admin_command(chat_id: str, text: str):
             return
         prefix = parts[1].upper()
         
-        authorized = load_json(AUTHORIZED_FILE, [])
+        authorized = db_get_authorized()
         found = None
         for hwid in authorized:
             if hwid.upper().startswith(prefix):
@@ -231,8 +447,7 @@ async def handle_admin_command(chat_id: str, text: str):
                 break
         
         if found:
-            authorized.remove(found)
-            save_json(AUTHORIZED_FILE, authorized)
+            db_remove_authorized(found)
             short_display = short_hwid_display(found)
             send_message_to_chat(chat_id, f"⛔ Removed: <code>{short_display}</code>...")
         else:
@@ -325,14 +540,13 @@ async def activate(request: ActivationRequest):
     hwid = request.hwid.strip().upper()
     print(f"[ACTIVATE] request for HWID: {hwid}")
 
-    authorized = load_json(AUTHORIZED_FILE, [])
-    pending = load_json(PENDING_FILE, [])
+    authorized = db_get_authorized()
+    pending = db_get_pending()
 
     # not authorized -> add to pending and notify admin
     if hwid not in authorized:
         if hwid not in pending:
-            pending.append(hwid)
-            save_json(PENDING_FILE, pending)
+            db_add_pending(hwid)
 
         # Generate SECURE short ID (8 characters, unique)
         short_id = get_or_create_short_id(hwid)
@@ -352,6 +566,9 @@ async def activate(request: ActivationRequest):
             buttons
         )
         return {"authorized": False, "message": "HWID not approved"}
+
+    # Update last validated timestamp
+    db_update_last_validated(hwid)
 
     # authorized -> issue RSA-signed payload
     private_key_pem = os.getenv("RSA_PRIVATE_KEY")
@@ -389,15 +606,16 @@ async def validate(request: ValidateRequest):
     hwid = request.hwid.strip().upper()
     print(f"[VALIDATE] Проверка HWID: {hwid}")
 
-    authorized = load_json(AUTHORIZED_FILE, [])
-    pending = load_json(PENDING_FILE, [])
+    authorized = db_get_authorized()
+    pending = db_get_pending()
 
     if hwid in authorized:
+        # Update last validated timestamp
+        db_update_last_validated(hwid)
         return {"authorized": True}
 
     if hwid not in pending:
-        pending.append(hwid)
-        save_json(PENDING_FILE, pending)
+        db_add_pending(hwid)
 
         short_id = get_or_create_short_id(hwid)
         short_display = short_hwid_display(hwid)
@@ -422,12 +640,12 @@ async def validate(request: ValidateRequest):
 # ------------------------------------------------------------------
 @app.get("/pending-hwids")
 async def get_pending_hwids():
-    pending = load_json(PENDING_FILE, [])
+    pending = db_get_pending()
     return {"pending": pending}
 
 @app.get("/authorized-hwids")
 async def get_authorized_hwids():
-    auth = load_json(AUTHORIZED_FILE, [])
+    auth = db_get_authorized()
     return {"authorized": auth}
 
 @app.post("/approve/{hwid_or_short}")
@@ -435,8 +653,8 @@ async def approve_hwid(hwid_or_short: str):
     """Approve by full HWID, short display (12 chars), or short_id (8 chars)"""
     input_val = hwid_or_short.strip().upper()
     
-    auth = load_json(AUTHORIZED_FILE, [])
-    pending = load_json(PENDING_FILE, [])
+    auth = db_get_authorized()
+    pending = db_get_pending()
     
     # Try as short_id first (8 chars from mapping)
     if len(input_val) == 8:
@@ -459,12 +677,10 @@ async def approve_hwid(hwid_or_short: str):
         hw = input_val
     
     if hw not in auth:
-        auth.append(hw)
-        save_json(AUTHORIZED_FILE, auth)
+        db_add_authorized(hw)
     
     if hw in pending:
-        pending.remove(hw)
-        save_json(PENDING_FILE, pending)
+        db_remove_pending(hw)
     
     short_display = short_hwid_display(hw)
     send_telegram(f"✅ HWID разрешён:\n<code>{short_display}</code>...")
@@ -525,28 +741,28 @@ async def bot_webhook(token: str, request: Request):
             answer_callback_query(cq_id, "ID not found")
             return {"ok": True}
         
-        authorized = load_json(AUTHORIZED_FILE, [])
-        pending = load_json(PENDING_FILE, [])
+        authorized = db_get_authorized()
+        pending = db_get_pending()
         
         hw = hwid.upper()
 
         if action == "approve":
             if hw not in authorized:
-                authorized.append(hw)
-                save_json(AUTHORIZED_FILE, authorized)
+                db_add_authorized(hw)
 
             if hw in pending:
-                pending.remove(hw)
-                save_json(PENDING_FILE, pending)
+                db_remove_pending(hw)
 
             answer_callback_query(cq_id, "Approved")
             short_display = short_hwid_display(hw)
             send_telegram(f"✅ Approved:\n<code>{short_display}</code>...")
 
         elif action == "deny":
+            # Remove from BOTH pending AND authorized (if exists)
             if hw in pending:
-                pending.remove(hw)
-                save_json(PENDING_FILE, pending)
+                db_remove_pending(hw)
+            if hw in authorized:
+                db_remove_authorized(hw)
 
             answer_callback_query(cq_id, "Denied")
             short_display = short_hwid_display(hw)
