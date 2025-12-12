@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: asl-proxy
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
