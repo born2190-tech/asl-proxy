@@ -17,9 +17,9 @@ from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 
 # PostgreSQL
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 # ------------------------------------------------------------------
 # Config
@@ -51,10 +51,10 @@ def init_db_pool():
         return
     
     try:
-        db_pool = SimpleConnectionPool(
-            minconn=1,
-            maxconn=10,
-            dsn=DATABASE_URL
+        db_pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=1,
+            max_size=10
         )
         print("[DB] Connection pool created")
         init_tables()
@@ -399,6 +399,8 @@ async def handle_admin_command(chat_id: str, text: str):
             "<b>Admin Commands:</b>\n"
             "/list – show authorized HWIDs\n"
             "/pending – show pending HWIDs\n"
+            "/view &lt;HWID_short&gt; – view HWID details\n"
+            "/stats – database statistics\n"
             "/remove &lt;HWID_short&gt; – remove HWID\n"
             "/clear_pending – clear pending list\n"
         )
@@ -431,6 +433,119 @@ async def handle_admin_command(chat_id: str, text: str):
     if cmd == "/clear_pending":
         db_clear_pending()
         send_message_to_chat(chat_id, "<b>Pending list cleared.</b>")
+        return
+
+    if cmd == "/stats":
+        authorized = db_get_authorized()
+        pending = db_get_pending()
+        
+        # Get mapping count
+        conn = None
+        mapping_count = 0
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM hwid_mapping")
+            mapping_count = cursor.fetchone()[0]
+        except:
+            pass
+        finally:
+            if conn:
+                return_db_connection(conn)
+        
+        msg = (
+            f"📊 <b>Database Statistics:</b>\n\n"
+            f"✅ Authorized: {len(authorized)}\n"
+            f"⏳ Pending: {len(pending)}\n"
+            f"🔗 Mappings: {mapping_count}\n"
+        )
+        send_message_to_chat(chat_id, msg)
+        return
+
+    if cmd == "/view":
+        if len(parts) < 2:
+            send_message_to_chat(chat_id, "Usage: /view &lt;HWID_prefix or short_id&gt;")
+            return
+        
+        input_val = parts[1].upper()
+        
+        # Try as short_id first
+        if len(input_val) == 8:
+            hwid = get_hwid_from_short_id(input_val)
+        else:
+            # Try prefix search
+            hwid = None
+            auth = db_get_authorized()
+            pending = db_get_pending()
+            for h in auth + pending:
+                if h.upper().startswith(input_val):
+                    hwid = h
+                    break
+        
+        if not hwid:
+            send_message_to_chat(chat_id, f"<b>HWID not found:</b> <code>{input_val}</code>")
+            return
+        
+        # Get details from database
+        conn = None
+        details = {}
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Check authorized
+            cursor.execute(
+                "SELECT created_at, last_validated FROM authorized_hwids WHERE hwid = %s",
+                (hwid,)
+            )
+            row = cursor.fetchone()
+            if row:
+                details['status'] = '✅ Authorized'
+                details['created_at'] = row[0].strftime('%Y-%m-%d %H:%M:%S')
+                details['last_validated'] = row[1].strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                # Check pending
+                cursor.execute(
+                    "SELECT created_at FROM pending_hwids WHERE hwid = %s",
+                    (hwid,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    details['status'] = '⏳ Pending'
+                    details['created_at'] = row[0].strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    details['status'] = '❓ Unknown'
+            
+            # Get short_id
+            cursor.execute(
+                "SELECT short_id FROM hwid_mapping WHERE full_hwid = %s",
+                (hwid,)
+            )
+            row = cursor.fetchone()
+            if row:
+                details['short_id'] = row[0]
+        except Exception as e:
+            print(f"[DB] Error in /view: {e}")
+        finally:
+            if conn:
+                return_db_connection(conn)
+        
+        short_display = short_hwid_display(hwid)
+        msg = (
+            f"🔍 <b>HWID Details:</b>\n\n"
+            f"<b>Short:</b> <code>{short_display}</code>...\n"
+            f"<b>Full:</b> <code>{hwid}</code>\n\n"
+            f"<b>Status:</b> {details.get('status', 'Unknown')}\n"
+        )
+        
+        if 'short_id' in details:
+            msg += f"<b>ID:</b> <code>{details['short_id']}</code>\n"
+        if 'created_at' in details:
+            msg += f"<b>Created:</b> {details['created_at']}\n"
+        if 'last_validated' in details:
+            msg += f"<b>Last Check:</b> {details['last_validated']}\n"
+        
+        send_message_to_chat(chat_id, msg)
         return
 
     if cmd == "/remove":
@@ -784,4 +899,3 @@ async def health():
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
-
