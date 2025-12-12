@@ -3,5 +3,5 @@ uvicorn==0.24.0
 pydantic==2.5.0
 requests==2.31.0
 pycryptodome==3.19.0
-psycopg-binary==3.2.1
-psycopg-pool==3.2.2
+psycopg-binary==3.2.13
+psycopg-pool==3.2.5
