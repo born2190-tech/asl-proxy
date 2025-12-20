@@ -30,7 +30,9 @@ ASL_API_KEY = os.getenv("ASL_API_KEY")
 BUSINESS_PLACE_ID = os.getenv("BUSINESS_PLACE_ID")
 AUTHORIZED_MACS_URL = os.getenv("AUTHORIZED_MACS_URL")
 AUTHORIZED_MACS = os.getenv("AUTHORIZED_MACS", "")
-ASL_URL = "https://xtrace.aslbelgisi.uz/public/api/v1/doc/aggregation"
+ASL_AGGREGATION_URL = "https://xtrace.aslbelgisi.uz/public/api/v1/doc/aggregation"
+ASL_UTILISATION_URL = "https://xtrace.aslbelgisi.uz/api/utilisation"
+ASL_URL = ASL_AGGREGATION_URL  # For backwards compatibility
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
@@ -466,6 +468,21 @@ class AggregationResponse(BaseModel):
     status_code: int
     body: dict
 
+class UtilisationRequest(BaseModel):
+    """Запрос для отчета о нанесении маркировки"""
+    sntins: List[str]  # Массив кодов маркировки
+    businessPlaceId: int = None  # Будет заполнен на сервере
+    releaseType: str  # PRODUCTION или IMPORT
+    manufacturerCountry: str  # Код страны (UZ для Узбекистана)
+    productionOrderId: str = None
+    productionDate: str = None  # ISO 8601 format
+    expirationDate: str = None  # ISO 8601 format
+    seriesNumber: str = None
+
+class UtilisationResponse(BaseModel):
+    status_code: int
+    body: dict
+
 class ActivationRequest(BaseModel):
     hwid: str
 
@@ -523,6 +540,81 @@ async def aggregation(request: AggregationRequest, x_client_mac: str = Header(..
     except Exception:
         body = {"raw_response": r.text}
     return AggregationResponse(status_code=r.status_code, body=body)
+
+# ------------------------------------------------------------------
+# /utilisation - Report on marking application
+# ------------------------------------------------------------------
+@app.post("/utilisation", response_model=UtilisationResponse)
+async def utilisation(request: UtilisationRequest, x_client_mac: str = Header(...), product_group: str = Header(...)):
+    """
+    Отчет о нанесении (использовании) кодов маркировки
+    
+    Headers:
+        - X-Client-Mac: MAC адрес клиента
+        - product-group: Товарная группа (см. справочник ASL)
+    
+    Body parameters:
+        - sntins: массив полных кодов маркировки
+        - releaseType: PRODUCTION или IMPORT
+        - manufacturerCountry: код страны (UZ для Узбекистана)
+        - productionOrderId: ID производственного заказа (опционально)
+        - productionDate: дата производства ISO 8601 (опционально для некоторых ТГ)
+        - expirationDate: срок годности ISO 8601 (опционально для некоторых ТГ)
+        - seriesNumber: номер серии (опционально для некоторых ТГ)
+    """
+    print(f"\n[UTILISATION] MAC: {x_client_mac}, Product Group: {product_group}")
+    
+    # Check MAC authorization
+    if not check_mac_authorization(x_client_mac):
+        raise HTTPException(status_code=403, detail="MAC address not authorized")
+    
+    # Check ASL config
+    if not ASL_API_KEY or not BUSINESS_PLACE_ID:
+        raise HTTPException(status_code=500, detail="ASL config missing")
+    
+    # Prepare request body
+    utilisation_data = {
+        "sntins": request.sntins,
+        "businessPlaceId": int(BUSINESS_PLACE_ID),
+        "releaseType": request.releaseType,
+        "manufacturerCountry": request.manufacturerCountry
+    }
+    
+    # Add optional fields if provided
+    if request.productionOrderId:
+        utilisation_data["productionOrderId"] = request.productionOrderId
+    if request.productionDate:
+        utilisation_data["productionDate"] = request.productionDate
+    if request.expirationDate:
+        utilisation_data["expirationDate"] = request.expirationDate
+    if request.seriesNumber:
+        utilisation_data["seriesNumber"] = request.seriesNumber
+    
+    # Prepare headers for ASL API
+    headers = {
+        "Authorization": f"Bearer {ASL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # Build URL with product_group query parameter
+    url = f"{ASL_UTILISATION_URL}?productGroup={product_group}"
+    
+    print(f"[UTILISATION] Sending to ASL: {url}")
+    print(f"[UTILISATION] Codes count: {len(request.sntins)}")
+    
+    try:
+        r = requests.post(url, json=utilisation_data, headers=headers, timeout=30)
+        print(f"[UTILISATION] ASL response: {r.status_code}")
+    except requests.RequestException as e:
+        print(f"[UTILISATION] Request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"ASL request failed: {e}")
+    
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw_response": r.text}
+    
+    return UtilisationResponse(status_code=r.status_code, body=body)
 
 # ------------------------------------------------------------------
 # /check-auth
