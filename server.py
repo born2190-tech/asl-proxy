@@ -382,6 +382,11 @@ async def root():
         }
     }
 
+@app.get("/health")
+async def health():
+    """Health check для protection.dll"""
+    return {"status": "ok"}
+
 @app.post("/validate")
 async def validate(request: ValidateRequest):
     """Проверка лицензии по HWID"""
