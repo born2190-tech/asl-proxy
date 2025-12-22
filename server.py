@@ -484,7 +484,7 @@ async def utilisation(request: UtilisationRequest):
     
     try:
         response = requests.post(
-            f"{ASL_API_URL}/utilisation",
+            f"{ASL_API_URL}/public/api/cod/utilization-ci",  # ✅ Правильный endpoint
             json=asl_request,
             headers=headers,
             timeout=60
