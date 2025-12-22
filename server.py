@@ -5,6 +5,7 @@
 
 import os
 import json
+import base64
 import traceback
 import uuid
 from typing import Any, Dict, List
@@ -425,9 +426,23 @@ async def validate(request: ValidateRequest):
 async def aggregation(request: AggregationRequest):
     """Отправка отчёта об агрегации"""
     
+    # Декодируем documentBody из base64
+    try:
+        document_body_json = base64.b64decode(request.documentBody).decode('utf-8')
+        document_body = json.loads(document_body_json)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid documentBody: {str(e)}")
+    
+    # Добавляем businessPlaceId из переменных окружения
+    document_body["businessPlaceId"] = int(BUSINESS_PLACE_ID)
+    
+    # Кодируем обратно в base64
+    updated_json = json.dumps(document_body, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    updated_base64 = base64.b64encode(updated_json.encode('utf-8')).decode('utf-8')
+    
     # Формируем запрос к ASL API
     asl_request = {
-        "documentBody": request.documentBody  # Передаём base64 как есть
+        "documentBody": updated_base64  # С businessPlaceId внутри!
     }
     
     headers = {
@@ -437,7 +452,7 @@ async def aggregation(request: AggregationRequest):
     
     try:
         response = requests.post(
-            f"{ASL_API_URL}/public/api/v1/doc/aggregation",  # ✅ Правильный из документации
+            f"{ASL_API_URL}/public/api/v1/doc/aggregation",
             json=asl_request,
             headers=headers,
             timeout=60
