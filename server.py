@@ -439,7 +439,7 @@ async def aggregation(request: AggregationRequest):
     
     try:
         response = requests.post(
-            f"{ASL_API_URL}/doc/aggregation",
+            f"{ASL_API_URL}/public/api/v1/doc/aggregation",  # ✅ Правильный из документации
             json=asl_request,
             headers=headers,
             timeout=60
