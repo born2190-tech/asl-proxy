@@ -348,8 +348,7 @@ class ValidateRequest(BaseModel):
     hwid: str
 
 class AggregationRequest(BaseModel):
-    sscc: str
-    codes: list
+    documentBody: str  # Base64 encoded JSON
 
 class UtilisationRequest(BaseModel):
     sntins: list
@@ -428,8 +427,7 @@ async def aggregation(request: AggregationRequest):
     
     # Формируем запрос к ASL API
     asl_request = {
-        "aggregationUnit": request.sscc,
-        "aggregatedItemList": request.codes
+        "documentBody": request.documentBody  # Передаём base64 как есть
     }
     
     headers = {
