@@ -22,6 +22,11 @@ import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
+# Crypto for RSA signatures
+from Crypto.Signature import pkcs1_15
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
+
 # ------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------
@@ -367,6 +372,114 @@ class SearchCodeRequest(BaseModel):
 class ProductInfoRequest(BaseModel):
     product_id: str
 
+class ActivationRequest(BaseModel):
+    hwid: str
+
+
+
+# ------------------------------------------------------------------
+# Telegram admin helpers
+# ------------------------------------------------------------------
+def send_message_to_chat(chat_id: str, text: str):
+    if not BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        traceback.print_exc()
+
+
+def answer_callback_query(callback_query_id: str, text: str = ""):
+    if not BOT_TOKEN:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+        requests.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=5)
+    except Exception:
+        traceback.print_exc()
+
+
+
+async def handle_admin_command(chat_id: str, text: str):
+    """Processes admin text commands"""
+    text = (text or "").strip()
+    parts = text.split()
+    if not parts:
+        return
+
+    cmd = parts[0].lower()
+
+    if cmd == "/help":
+        send_message_to_chat(chat_id,
+            "<b>Admin Commands:</b>\n"
+            "/list – show authorized HWIDs\n"
+            "/pending – show pending HWIDs\n"
+            "/remove &lt;HWID_short&gt; – remove HWID\n"
+            "/clear_pending – clear pending list\n"
+        )
+        return
+
+    if cmd == "/list":
+        authorized = db_get_authorized()
+        if not authorized:
+            send_message_to_chat(chat_id, "<b>Authorized list is empty.</b>")
+        else:
+            msg = "<b>Authorized HWIDs:</b>\n"
+            for a in authorized:
+                short_display = short_hwid_display(a)
+                msg += f"- <code>{short_display}</code>...\n"
+            send_message_to_chat(chat_id, msg)
+        return
+
+    if cmd == "/pending":
+        pending = db_get_pending()
+        if not pending:
+            send_message_to_chat(chat_id, "<b>Pending list is empty.</b>")
+        else:
+            msg = "<b>Pending HWIDs:</b>\n"
+            for p in pending:
+                short_display = short_hwid_display(p)
+                msg += f"- <code>{short_display}</code>...\n"
+            send_message_to_chat(chat_id, msg)
+        return
+
+    if cmd == "/clear_pending":
+        db_clear_pending()
+        send_message_to_chat(chat_id, "<b>Pending list cleared.</b>")
+        return
+
+    if cmd == "/remove":
+        if len(parts) < 2:
+            send_message_to_chat(chat_id, "Usage: /remove &lt;HWID_prefix&gt;")
+            return
+        prefix = parts[1].upper()
+        
+        authorized = db_get_authorized()
+        found = None
+        for hwid in authorized:
+            if hwid.upper().startswith(prefix):
+                found = hwid
+                break
+        
+        if found:
+            db_remove_authorized(found)
+            short_display = short_hwid_display(found)
+            send_message_to_chat(chat_id, f"⛔ Removed: <code>{short_display}</code>...")
+        else:
+            send_message_to_chat(chat_id, f"<b>HWID not found with prefix:</b> <code>{prefix}</code>")
+        return
+
+    send_message_to_chat(chat_id, "Unknown command. Use /help.")
+
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -378,6 +491,7 @@ async def root():
         "service": "ASL BELGISI Proxy Server",
         "version": "1.4.0",
         "endpoints": {
+            "activate": "POST /activate",
             "validate": "POST /validate",
             "aggregation": "POST /aggregation",
             "utilisation": "POST /utilisation",
@@ -389,6 +503,68 @@ async def root():
 async def health():
     """Health check для protection.dll"""
     return {"status": "ok"}
+
+@app.post("/activate")
+async def activate(request: ActivationRequest):
+    hwid = request.hwid.strip().upper()
+    print(f"[ACTIVATE] request for HWID: {hwid}")
+
+    authorized = db_get_authorized()
+    pending = db_get_pending()
+
+    # not authorized -> add to pending and notify admin
+    if hwid not in authorized:
+        if hwid not in pending:
+            db_add_pending(hwid)
+
+        # Generate SECURE short ID (8 characters, unique)
+        short_id = get_or_create_short_id(hwid)
+        short_display = short_hwid_display(hwid)
+        
+        # callback_data is now just 8 characters + "approve:" = 16 bytes total
+        buttons = [
+            [{"text": "✅ Разрешить", "callback_data": f"approve:{short_id}"}],
+            [{"text": "⛔ Блокировать", "callback_data": f"deny:{short_id}"}]
+        ]
+        
+        send_telegram(
+            f"🔐 <b>Новый HWID запросил доступ:</b>\n"
+            f"<code>{short_display}</code>...\n\n"
+            f"<b>ID:</b> <code>{short_id}</code>\n"
+            f"<i>Полный HWID: {hwid}</i>",
+            buttons
+        )
+        return {"authorized": False, "message": "HWID not approved"}
+
+    # Update last validated timestamp
+    db_update_last_validated(hwid)
+
+    # authorized -> issue RSA-signed payload
+    private_key_pem = os.getenv("RSA_PRIVATE_KEY")
+    if not private_key_pem:
+        raise HTTPException(status_code=500, detail="RSA_PRIVATE_KEY not configured")
+
+    try:
+        private_key = RSA.import_key(private_key_pem)
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Invalid RSA private key")
+
+    payload = {"hwid": hwid, "valid": True, "exp": "2030-01-01"}
+    payload_str = json.dumps(payload, separators=(",", ":"))
+    payload_b64 = base64.b64encode(payload_str.encode()).decode()
+
+    try:
+        h = SHA256.new(payload_str.encode())
+        signature = pkcs1_15.new(private_key).sign(h)
+        signature_b64 = base64.b64encode(signature).decode()
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Signing failed")
+
+    return {"authorized": True, "payload": payload_b64, "signature": signature_b64}
+
+
 
 @app.post("/validate")
 async def validate(request: ValidateRequest):
@@ -624,55 +800,88 @@ async def deny(hwid_or_short: str):
 
 @app.post("/bot/{token}")
 async def bot_webhook(token: str, request: Request):
-    """Telegram bot webhook"""
-    if token != BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
+    if not BOT_TOKEN or token != BOT_TOKEN:
+        return {"ok": False, "error": "token mismatch"}
+
     try:
         data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+
+    # HANDLE TEXT MESSAGES
+    if "message" in data:
+        msg = data["message"]
+        chat_id = str(msg["chat"]["id"])
+        from_id = str(msg["from"]["id"])
+        text = msg.get("text", "")
         
-        if "callback_query" in data:
-            callback = data["callback_query"]
-            callback_data = callback.get("data", "")
-            
-            if callback_data.startswith("approve:"):
-                short_id = callback_data.split(":")[1]
-                hwid = get_hwid_from_short_id(short_id)
-                
-                if hwid:
-                    db_add_authorized(hwid)
-                    db_remove_pending(hwid)
-                    
-                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
-                    requests.post(url, json={
-                        "callback_query_id": callback["id"],
-                        "text": f"✅ Устройство {short_hwid_display(hwid)} авторизовано!"
-                    })
-                    
-                    send_telegram(f"✅ <b>Устройство авторизовано:</b>\n<code>{short_hwid_display(hwid)}</code>")
-            
-            elif callback_data.startswith("deny:"):
-                short_id = callback_data.split(":")[1]
-                hwid = get_hwid_from_short_id(short_id)
-                
-                if hwid:
-                    db_remove_pending(hwid)
-                    db_remove_authorized(hwid)
-                    
-                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
-                    requests.post(url, json={
-                        "callback_query_id": callback["id"],
-                        "text": f"⛔ Устройство {short_hwid_display(hwid)} заблокировано!"
-                    })
-                    
-                    send_telegram(f"⛔ <b>Устройство заблокировано:</b>\n<code>{short_hwid_display(hwid)}</code>")
-        
+        print(f"[BOT] Message from {from_id}, text: {text}")
+        print(f"[BOT] ADMIN_ID from env: {ADMIN_ID}")
+        print(f"[BOT] Is admin: {str(ADMIN_ID) == from_id}")
+
+        if str(ADMIN_ID) == from_id:
+            await handle_admin_command(chat_id, text)
+        else:
+            send_message_to_chat(chat_id, "You are not allowed to use admin commands.")
+
         return {"ok": True}
-    
-    except Exception as e:
-        print(f"[BOT] Error: {e}")
-        traceback.print_exc()
-        return {"ok": False}
+
+    # HANDLE CALLBACK BUTTONS - using secure short_id mapping
+    if "callback_query" in data:
+        cq = data["callback_query"]
+        cmd = cq.get("data", "")
+        cq_id = cq.get("id")
+        from_id = str(cq["from"]["id"])
+
+        if str(ADMIN_ID) != from_id:
+            answer_callback_query(cq_id, "Not authorized")
+            return {"ok": True}
+
+        if ":" not in cmd:
+            answer_callback_query(cq_id, "Unknown cmd")
+            return {"ok": True}
+
+        action, short_id = cmd.split(":", 1)
+        
+        # Get full HWID from secure mapping
+        hwid = get_hwid_from_short_id(short_id)
+        
+        if not hwid:
+            answer_callback_query(cq_id, "ID not found")
+            return {"ok": True}
+        
+        authorized = db_get_authorized()
+        pending = db_get_pending()
+        
+        hw = hwid.upper()
+
+        if action == "approve":
+            if hw not in authorized:
+                db_add_authorized(hw)
+
+            if hw in pending:
+                db_remove_pending(hw)
+
+            answer_callback_query(cq_id, "Approved")
+            short_display = short_hwid_display(hw)
+            send_telegram(f"✅ Approved:\n<code>{short_display}</code>...")
+
+        elif action == "deny":
+            # Remove from BOTH pending AND authorized (if exists)
+            if hw in pending:
+                db_remove_pending(hw)
+            if hw in authorized:
+                db_remove_authorized(hw)
+
+            answer_callback_query(cq_id, "Denied")
+            short_display = short_hwid_display(hw)
+            send_telegram(f"⛔ Denied:\n<code>{short_display}</code>...")
+
+        return {"ok": True}
+
+    return {"ok": True}
+
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
