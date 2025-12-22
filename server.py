@@ -22,11 +22,6 @@ import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
-# Crypto for RSA signatures
-from Crypto.Signature import pkcs1_15
-from Crypto.Hash import SHA256
-from Crypto.PublicKey import RSA
-
 # ------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------
@@ -372,10 +367,6 @@ class SearchCodeRequest(BaseModel):
 class ProductInfoRequest(BaseModel):
     product_id: str
 
-class ActivationRequest(BaseModel):
-    hwid: str
-
-
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -387,7 +378,6 @@ async def root():
         "service": "ASL BELGISI Proxy Server",
         "version": "1.4.0",
         "endpoints": {
-            "activate": "POST /activate",
             "validate": "POST /validate",
             "aggregation": "POST /aggregation",
             "utilisation": "POST /utilisation",
@@ -399,68 +389,6 @@ async def root():
 async def health():
     """Health check для protection.dll"""
     return {"status": "ok"}
-
-@app.post("/activate")
-async def activate(request: ActivationRequest):
-    hwid = request.hwid.strip().upper()
-    print(f"[ACTIVATE] request for HWID: {hwid}")
-
-    authorized = db_get_authorized()
-    pending = db_get_pending()
-
-    # not authorized -> add to pending and notify admin
-    if hwid not in authorized:
-        if hwid not in pending:
-            db_add_pending(hwid)
-
-        # Generate SECURE short ID (8 characters, unique)
-        short_id = get_or_create_short_id(hwid)
-        short_display = short_hwid_display(hwid)
-        
-        # callback_data is now just 8 characters + "approve:" = 16 bytes total
-        buttons = [
-            [{"text": "✅ Разрешить", "callback_data": f"approve:{short_id}"}],
-            [{"text": "⛔ Блокировать", "callback_data": f"deny:{short_id}"}]
-        ]
-        
-        send_telegram(
-            f"🔐 <b>Новый HWID запросил доступ:</b>\n"
-            f"<code>{short_display}</code>...\n\n"
-            f"<b>ID:</b> <code>{short_id}</code>\n"
-            f"<i>Полный HWID: {hwid}</i>",
-            buttons
-        )
-        return {"authorized": False, "message": "HWID not approved"}
-
-    # Update last validated timestamp
-    db_update_last_validated(hwid)
-
-    # authorized -> issue RSA-signed payload
-    private_key_pem = os.getenv("RSA_PRIVATE_KEY")
-    if not private_key_pem:
-        raise HTTPException(status_code=500, detail="RSA_PRIVATE_KEY not configured")
-
-    try:
-        private_key = RSA.import_key(private_key_pem)
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Invalid RSA private key")
-
-    payload = {"hwid": hwid, "valid": True, "exp": "2030-01-01"}
-    payload_str = json.dumps(payload, separators=(",", ":"))
-    payload_b64 = base64.b64encode(payload_str.encode()).decode()
-
-    try:
-        h = SHA256.new(payload_str.encode())
-        signature = pkcs1_15.new(private_key).sign(h)
-        signature_b64 = base64.b64encode(signature).decode()
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Signing failed")
-
-    return {"authorized": True, "payload": payload_b64, "signature": signature_b64}
-
-
 
 @app.post("/validate")
 async def validate(request: ValidateRequest):
