@@ -364,6 +364,9 @@ class UtilisationRequest(BaseModel):
 class SearchCodeRequest(BaseModel):
     code: str
 
+class ProductInfoRequest(BaseModel):
+    product_id: str
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -547,6 +550,37 @@ async def search_code(request: SearchCodeRequest):
             json=asl_request,
             headers=headers,
             timeout=30
+        )
+        
+        return {
+            "status_code": response.status_code,
+            "body": response.json() if response.status_code == 200 else response.text
+        }
+    
+    except requests.Timeout:
+        raise HTTPException(status_code=504, detail="Timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/get-product-info")
+async def get_product_info(request: ProductInfoRequest):
+    """
+    Получение информации о товаре по productId из реестра
+    Возвращает название товара и другие данные
+    """
+    
+    asl_url = f"{ASL_API_URL}/public/api/v1/product-registry/product/{request.product_id}"
+    
+    headers = {
+        "Authorization": f"Bearer {ASL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.get(
+            asl_url,
+            headers=headers,
+            timeout=15
         )
         
         return {
