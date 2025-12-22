@@ -353,7 +353,6 @@ class AggregationRequest(BaseModel):
 
 class UtilisationRequest(BaseModel):
     sntins: list
-    businessPlaceId: int  # ✅ ОБЯЗАТЕЛЬНО!
     releaseType: str
     manufacturerCountry: str
     productGroup: str
@@ -460,10 +459,10 @@ async def aggregation(request: AggregationRequest):
 async def utilisation(request: UtilisationRequest):
     """Отправка отчёта о нанесении"""
     
-    # Формируем запрос к ASL API (без productGroup в теле - он будет в query)
+    # Формируем запрос к ASL API
     asl_request = {
         "sntins": request.sntins,
-        "businessPlaceId": request.businessPlaceId,  # ✅ ОБЯЗАТЕЛЬНО!
+        "businessPlaceId": int(BUSINESS_PLACE_ID),  # ✅ Берём с сервера!
         "releaseType": request.releaseType,
         "manufacturerCountry": request.manufacturerCountry
     }
