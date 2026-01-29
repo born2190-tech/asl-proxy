@@ -1,6 +1,7 @@
 """
 ПОЛНЫЙ прокси-сервер для ASL BELGISI API
 С поддержкой: лицензирования, агрегации, нанесения, поиска кодов
+ОБНОВЛЕНО: Поддержка Neon.tech PostgreSQL (бесплатно)
 """
 
 import os
@@ -39,7 +40,7 @@ ASL_API_URL = "https://xtrace.aslbelgisi.uz"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
-# PostgreSQL
+# PostgreSQL - теперь с Neon.tech!
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ------------------------------------------------------------------
@@ -55,15 +56,17 @@ def init_db_pool():
         return
     
     try:
+        # Neon.tech требует SSL
         db_pool = SimpleConnectionPool(
             minconn=1,
             maxconn=10,
-            dsn=DATABASE_URL
+            dsn=DATABASE_URL,
+            sslmode='require'  # ✅ ДОБАВЛЕНО для Neon.tech
         )
-        print("[DB] Connection pool created")
+        print("[DB] ✅ Connection pool created (Neon.tech)")
         init_tables()
     except Exception as e:
-        print(f"[DB] Failed to create pool: {e}")
+        print(f"[DB] ❌ Failed to create pool: {e}")
         traceback.print_exc()
 
 def get_db_connection():
@@ -111,10 +114,10 @@ def init_tables():
         """)
         
         conn.commit()
-        print("[DB] Tables initialized")
+        print("[DB] ✅ Tables initialized")
         
     except Exception as e:
-        print(f"[DB] Failed to init tables: {e}")
+        print(f"[DB] ❌ Failed to init tables: {e}")
         traceback.print_exc()
     finally:
         if conn:
@@ -214,6 +217,20 @@ def db_remove_pending(hwid: str):
         conn.commit()
     except Exception as e:
         print(f"[DB] Error removing pending: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def db_clear_pending():
+    """Clear all pending HWIDs"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pending_hwids")
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Error clearing pending: {e}")
     finally:
         if conn:
             return_db_connection(conn)
@@ -333,7 +350,7 @@ def send_telegram(message: str, buttons: List[List[Dict]] = None):
 # ------------------------------------------------------------------
 # FastAPI init
 # ------------------------------------------------------------------
-app = FastAPI(title="ASL BELGISI Proxy Server")
+app = FastAPI(title="ASL BELGISI Proxy Server (Neon.tech Edition)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -489,7 +506,8 @@ async def root():
     """Главная страница"""
     return {
         "service": "ASL BELGISI Proxy Server",
-        "version": "1.4.0",
+        "version": "1.5.0 (Neon.tech Edition)",
+        "database": "Neon.tech PostgreSQL (Free)",
         "endpoints": {
             "activate": "POST /activate",
             "validate": "POST /validate",
@@ -502,7 +520,7 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check для protection.dll"""
-    return {"status": "ok"}
+    return {"status": "ok", "database": "neon.tech"}
 
 @app.post("/activate")
 async def activate(request: ActivationRequest):
