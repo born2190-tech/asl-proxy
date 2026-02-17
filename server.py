@@ -732,6 +732,7 @@ async def search_code(request: SearchCodeRequest):
     """
     
     private_url = f"{ASL_API_URL}/public/api/cod/private/codes"
+    private_single_url = f"{ASL_API_URL}/api/cod/private/code"
     public_url = f"{ASL_API_URL}/public/api/cod/public/codes"
 
     headers = {
@@ -776,7 +777,20 @@ async def search_code(request: SearchCodeRequest):
                 "body": body if response.status_code == 200 else response.text
             }
 
-        print(f"[SEARCH-CODE] private/codes OWNER_CHANGE fallback for code={request.code[:40]}...")
+        print(f"[SEARCH-CODE] private/codes OWNER_CHANGE -> trying /api/cod/private/code for code={request.code[:40]}...")
+        single_resp = requests.post(
+            private_single_url,
+            json={"id": request.code},
+            headers=headers,
+            timeout=30
+        )
+        if single_resp.status_code == 200:
+            return {
+                "status_code": 200,
+                "body": single_resp.json()
+            }
+
+        print(f"[SEARCH-CODE] /api/cod/private/code failed ({single_resp.status_code}) -> fallback public/codes")
         pub_response = requests.post(
             public_url,
             json=asl_request,
