@@ -392,11 +392,6 @@ class ProductInfoRequest(BaseModel):
 class ActivationRequest(BaseModel):
     hwid: str
 
-class OrderCodesRequest(BaseModel):
-    orderId: str
-    gtin: str
-    quantity: int = 150000
-
 
 
 # ------------------------------------------------------------------
@@ -787,75 +782,6 @@ async def get_product_info(request: ProductInfoRequest):
             "body": response.json() if response.status_code == 200 else response.text
         }
     
-    except requests.Timeout:
-        raise HTTPException(status_code=504, detail="Timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/order-codes")
-async def order_codes(request: OrderCodesRequest):
-    """
-    Получить все КМ из подзаказа эмиссии в порядке выдачи.
-    Порядок совпадает с порядком в CSV/PDF файлах.
-    Параметры: orderId, gtin, quantity (макс 150000)
-    """
-    headers = {
-        "Authorization": f"Bearer {ASL_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    all_codes = []
-    last_pack_id = None
-
-    # Выгружаем пакетами по 10000 (лимит API)
-    batch_size = 10000
-    remaining = request.quantity
-
-    try:
-        while remaining > 0:
-            fetch_qty = min(batch_size, remaining)
-            params = {
-                "orderId": request.orderId,
-                "gtin": request.gtin,
-                "quantity": fetch_qty
-            }
-            if last_pack_id:
-                params["lastPackId"] = last_pack_id
-
-            response = requests.get(
-                f"{ASL_API_URL}/api/codes",
-                headers=headers,
-                params=params,
-                timeout=60
-            )
-
-            if response.status_code != 200:
-                # Заказ закрыт или коды закончились — возвращаем что есть
-                break
-
-            data = response.json()
-            codes = data.get("codes", [])
-            pack_id = data.get("packId")
-
-            if not codes:
-                break
-
-            all_codes.extend(codes)
-            last_pack_id = pack_id
-            remaining -= len(codes)
-
-            # Если вернулось меньше чем просили — больше нет
-            if len(codes) < fetch_qty:
-                break
-
-        return {
-            "status_code": 200,
-            "body": {
-                "codes": all_codes,
-                "total": len(all_codes)
-            }
-        }
-
     except requests.Timeout:
         raise HTTPException(status_code=504, detail="Timeout")
     except Exception as e:
