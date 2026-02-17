@@ -392,6 +392,11 @@ class ProductInfoRequest(BaseModel):
 class ActivationRequest(BaseModel):
     hwid: str
 
+class OrderCodesRequest(BaseModel):
+    orderId: str
+    gtin: str
+    quantity: int = 150000
+
 
 
 # ------------------------------------------------------------------
@@ -726,29 +731,62 @@ async def search_code(request: SearchCodeRequest):
     - все параметры товара
     """
     
-    # Вызываем ASL API для получения детальной информации
-    asl_url = f"{ASL_API_URL}/public/api/cod/private/codes"
-    
+    private_url = f"{ASL_API_URL}/public/api/cod/private/codes"
+    public_url = f"{ASL_API_URL}/public/api/cod/public/codes"
+
     headers = {
         "Authorization": f"Bearer {ASL_API_KEY}",
         "Content-Type": "application/json"
     }
-    
+
     asl_request = {
         "codes": [request.code]
     }
-    
+
     try:
         response = requests.post(
-            asl_url,
+            private_url,
             json=asl_request,
             headers=headers,
             timeout=30
         )
-        
+
+        def _is_owner_change_error(status_code: int, body_obj: Any, text_body: str) -> bool:
+            try:
+                results = body_obj if isinstance(body_obj, list) else body_obj.get("results", [])
+                first = results[0] if results else {}
+                if (
+                    isinstance(first, dict)
+                    and first.get("code") == "invalid-input-parameter"
+                    and "OWNER_CHANGE" in str(first.get("context", {}))
+                ):
+                    return True
+            except Exception:
+                pass
+
+            if status_code != 200 and "OWNER_CHANGE" in (text_body or ""):
+                return True
+
+            return False
+
+        body = response.json() if response.status_code == 200 else {}
+        if not _is_owner_change_error(response.status_code, body, response.text):
+            return {
+                "status_code": response.status_code,
+                "body": body if response.status_code == 200 else response.text
+            }
+
+        print(f"[SEARCH-CODE] private/codes OWNER_CHANGE fallback for code={request.code[:40]}...")
+        pub_response = requests.post(
+            public_url,
+            json=asl_request,
+            headers=headers,
+            timeout=30
+        )
+
         return {
-            "status_code": response.status_code,
-            "body": response.json() if response.status_code == 200 else response.text
+            "status_code": pub_response.status_code,
+            "body": pub_response.json() if pub_response.status_code == 200 else pub_response.text
         }
     
     except requests.Timeout:
@@ -782,6 +820,75 @@ async def get_product_info(request: ProductInfoRequest):
             "body": response.json() if response.status_code == 200 else response.text
         }
     
+    except requests.Timeout:
+        raise HTTPException(status_code=504, detail="Timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/order-codes")
+async def order_codes(request: OrderCodesRequest):
+    """
+    Получить все КМ из подзаказа эмиссии в порядке выдачи.
+    Порядок совпадает с порядком в CSV/PDF файлах.
+    Параметры: orderId, gtin, quantity (макс 150000)
+    """
+    headers = {
+        "Authorization": f"Bearer {ASL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    all_codes = []
+    last_pack_id = None
+
+    # Выгружаем пакетами по 10000 (лимит API)
+    batch_size = 10000
+    remaining = request.quantity
+
+    try:
+        while remaining > 0:
+            fetch_qty = min(batch_size, remaining)
+            params = {
+                "orderId": request.orderId,
+                "gtin": request.gtin,
+                "quantity": fetch_qty
+            }
+            if last_pack_id:
+                params["lastPackId"] = last_pack_id
+
+            response = requests.get(
+                f"{ASL_API_URL}/api/codes",
+                headers=headers,
+                params=params,
+                timeout=60
+            )
+
+            if response.status_code != 200:
+                # Заказ закрыт или коды закончились — возвращаем что есть
+                break
+
+            data = response.json()
+            codes = data.get("codes", [])
+            pack_id = data.get("packId")
+
+            if not codes:
+                break
+
+            all_codes.extend(codes)
+            last_pack_id = pack_id
+            remaining -= len(codes)
+
+            # Если вернулось меньше чем просили — больше нет
+            if len(codes) < fetch_qty:
+                break
+
+        return {
+            "status_code": 200,
+            "body": {
+                "codes": all_codes,
+                "total": len(all_codes)
+            }
+        }
+
     except requests.Timeout:
         raise HTTPException(status_code=504, detail="Timeout")
     except Exception as e:
