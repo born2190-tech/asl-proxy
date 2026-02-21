@@ -12,7 +12,7 @@ import uuid
 from typing import Any, Dict, List
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -518,6 +518,7 @@ async def root():
             "validate": "POST /validate",
             "aggregation": "POST /aggregation",
             "utilisation": "POST /utilisation",
+            "correction_km": "POST /correction-km",
             "search_code": "POST /search-code"
         }
     }
@@ -716,6 +717,52 @@ async def utilisation(request: UtilisationRequest):
             "body": response.json() if response.status_code == 200 else response.text
         }
     
+    except requests.Timeout:
+        raise HTTPException(status_code=504, detail="Timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/correction-km")
+async def correction_km(documentBody: UploadFile = File(...)):
+    """
+    Массовая корректировка КМ через xTrace Open API.
+    Форвардит CSV (multipart/form-data) как поле documentBody.
+    """
+    if not documentBody:
+        raise HTTPException(status_code=400, detail="documentBody file is required")
+
+    headers = {
+        "Authorization": f"Bearer {ASL_API_KEY}",
+    }
+
+    try:
+        content = await documentBody.read()
+        files = {
+            "documentBody": (
+                documentBody.filename or "correction.csv",
+                content,
+                documentBody.content_type or "text/csv"
+            )
+        }
+
+        response = requests.post(
+            f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv",
+            files=files,
+            headers=headers,
+            timeout=60
+        )
+
+        body = response.text
+        try:
+            body = response.json()
+        except Exception:
+            pass
+
+        return {
+            "status_code": response.status_code,
+            "body": body
+        }
+
     except requests.Timeout:
         raise HTTPException(status_code=504, detail="Timeout")
     except Exception as e:
