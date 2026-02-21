@@ -12,7 +12,7 @@ import uuid
 from typing import Any, Dict, List
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -723,7 +723,13 @@ async def utilisation(request: UtilisationRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/correction-km")
-async def correction_km(documentBody: UploadFile = File(...)):
+async def correction_km(
+    documentBody: UploadFile = File(...),
+    productionDatetime: str = Form(None),
+    expirationDatetime: str = Form(None),
+    manufacturerCountry: str = Form(None),
+    seriesNumber: str = Form(None),
+):
     """
     Массовая корректировка КМ через xTrace Open API.
     Форвардит CSV (multipart/form-data) как поле documentBody.
@@ -744,10 +750,20 @@ async def correction_km(documentBody: UploadFile = File(...)):
                 documentBody.content_type or "text/csv"
             )
         }
+        data = {}
+        if productionDatetime:
+            data["productionDatetime"] = productionDatetime
+        if expirationDatetime:
+            data["expirationDatetime"] = expirationDatetime
+        if manufacturerCountry:
+            data["manufacturerCountry"] = manufacturerCountry
+        if seriesNumber:
+            data["seriesNumber"] = seriesNumber
 
         response = requests.post(
             f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv",
             files=files,
+            data=data,
             headers=headers,
             timeout=60
         )
@@ -1071,4 +1087,3 @@ async def bot_webhook(token: str, request: Request):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
-
