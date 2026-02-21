@@ -8,9 +8,14 @@ import os
 import json
 import base64
 import traceback
+import builtins
 import uuid
 import csv
 import io
+import time
+import hmac
+import hashlib
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List
 from typing import Optional
@@ -40,6 +45,42 @@ ASL_API_KEY = os.getenv("ASL_API_KEY")
 BUSINESS_PLACE_ID = os.getenv("BUSINESS_PLACE_ID")
 ASL_API_URL = "https://xtrace.aslbelgisi.uz"
 
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+SESSION_TTL_SEC = int(os.getenv("SESSION_TTL_SEC", "900"))  # 15 min
+REPLAY_TTL_SEC = int(os.getenv("REPLAY_TTL_SEC", "600"))    # 10 min
+MAX_TS_SKEW_SEC = int(os.getenv("MAX_TS_SKEW_SEC", "300"))  # 5 min
+RATE_LIMIT_PER_MIN_HWID = int(os.getenv("RATE_LIMIT_PER_MIN_HWID", "120"))
+RATE_LIMIT_PER_MIN_IP = int(os.getenv("RATE_LIMIT_PER_MIN_IP", "240"))
+RELEASE_LOG_LEVEL = os.getenv("RELEASE_LOG_LEVEL", "INFO").upper()
+
+_ORIGINAL_PRINT = builtins.print
+
+
+def _filtered_print(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
+    if RELEASE_LOG_LEVEL in ("INFO", "ERROR"):
+        if "[DEBUG]" in text:
+            return
+    if RELEASE_LOG_LEVEL == "ERROR":
+        sensitive = (
+            "HWID:",
+            "[HWID]",
+            "Traceback",
+            "FULL body",
+            "response.text",
+            "Full result keys",
+        )
+        if any(marker in text for marker in sensitive):
+            return
+    _ORIGINAL_PRINT(*args, **kwargs)
+
+
+builtins.print = _filtered_print
+
+if not SESSION_SECRET:
+    SESSION_SECRET = secrets.token_urlsafe(48)
+    print("[SECURITY] WARNING: SESSION_SECRET not set, using runtime-generated secret (tokens reset on restart)")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
@@ -50,6 +91,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # PostgreSQL Connection Pool
 # ------------------------------------------------------------------
 db_pool = None
+nonce_cache: Dict[str, int] = {}
+rate_limit_hwid: Dict[str, List[float]] = {}
+rate_limit_ip: Dict[str, List[float]] = {}
 
 def init_db_pool():
     """Initialize PostgreSQL connection pool"""
@@ -400,6 +444,141 @@ class OrderCodesRequest(BaseModel):
     gtin: str
     quantity: int = 150000
 
+class DocumentStatusRequest(BaseModel):
+    document_id: str
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _issue_session_token(hwid: str) -> Dict[str, Any]:
+    now_ts = int(time.time())
+    exp_ts = now_ts + max(60, SESSION_TTL_SEC)
+    payload = {
+        "hwid": hwid.upper(),
+        "iat": now_ts,
+        "exp": exp_ts,
+        "jti": secrets.token_hex(8),
+    }
+    payload_raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = _b64url_encode(payload_raw)
+    sig = hmac.new(SESSION_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
+    token = f"{payload_b64}.{_b64url_encode(sig)}"
+    return {"token": token, "exp": exp_ts}
+
+
+def _verify_session_token(token: str, expected_hwid: str) -> bool:
+    try:
+        if not token or "." not in token:
+            return False
+        payload_b64, sig_b64 = token.split(".", 1)
+        expected_sig = hmac.new(
+            SESSION_SECRET.encode("utf-8"),
+            payload_b64.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+        provided_sig = _b64url_decode(sig_b64)
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            return False
+
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+        if str(payload.get("hwid", "")).upper() != expected_hwid.upper():
+            return False
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _prune_security_caches(now_ts: int):
+    expired_nonce_keys = [k for k, exp in nonce_cache.items() if exp <= now_ts]
+    for k in expired_nonce_keys:
+        nonce_cache.pop(k, None)
+
+    cutoff = now_ts - 60
+    for key in list(rate_limit_hwid.keys()):
+        fresh = [t for t in rate_limit_hwid[key] if t > cutoff]
+        if fresh:
+            rate_limit_hwid[key] = fresh
+        else:
+            rate_limit_hwid.pop(key, None)
+
+    for key in list(rate_limit_ip.keys()):
+        fresh = [t for t in rate_limit_ip[key] if t > cutoff]
+        if fresh:
+            rate_limit_ip[key] = fresh
+        else:
+            rate_limit_ip.pop(key, None)
+
+
+def _check_rate_limit(bucket: Dict[str, List[float]], key: str, limit_per_min: int, now_ts: int) -> bool:
+    entries = bucket.get(key, [])
+    cutoff = now_ts - 60
+    entries = [t for t in entries if t > cutoff]
+    if len(entries) >= max(1, limit_per_min):
+        bucket[key] = entries
+        return False
+    entries.append(float(now_ts))
+    bucket[key] = entries
+    return True
+
+
+def _enforce_critical_access(
+    request: Request,
+    x_session_token: Optional[str],
+    x_client_hwid: Optional[str],
+    x_client_ts: Optional[str],
+    x_client_nonce: Optional[str],
+) -> str:
+    if not x_session_token or not x_client_hwid or not x_client_ts or not x_client_nonce:
+        raise HTTPException(status_code=401, detail="Missing security headers")
+
+    hwid = x_client_hwid.strip().upper()
+    if not hwid:
+        raise HTTPException(status_code=401, detail="Invalid HWID header")
+
+    try:
+        client_ts = int(str(x_client_ts).strip())
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid timestamp header")
+
+    now_ts = int(time.time())
+    _prune_security_caches(now_ts)
+
+    if abs(now_ts - client_ts) > MAX_TS_SKEW_SEC:
+        raise HTTPException(status_code=401, detail="Timestamp skew too large")
+
+    nonce = x_client_nonce.strip()
+    if not nonce or len(nonce) > 128:
+        raise HTTPException(status_code=401, detail="Invalid nonce")
+
+    nonce_key = f"{hwid}:{nonce}"
+    if nonce_key in nonce_cache:
+        raise HTTPException(status_code=401, detail="Replay detected")
+    nonce_cache[nonce_key] = now_ts + REPLAY_TTL_SEC
+
+    client_ip = request.client.host if request and request.client else "unknown"
+    if not _check_rate_limit(rate_limit_hwid, hwid, RATE_LIMIT_PER_MIN_HWID, now_ts):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded (HWID)")
+    if not _check_rate_limit(rate_limit_ip, client_ip, RATE_LIMIT_PER_MIN_IP, now_ts):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded (IP)")
+
+    authorized = db_get_authorized()
+    if hwid not in authorized:
+        raise HTTPException(status_code=403, detail="HWID not authorized")
+
+    if not _verify_session_token(x_session_token, hwid):
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+
+    return hwid
+
 
 
 # ------------------------------------------------------------------
@@ -522,6 +701,7 @@ async def root():
             "aggregation": "POST /aggregation",
             "utilisation": "POST /utilisation",
             "correction_km": "POST /correction-km",
+            "correction_status": "POST /correction-status",
             "search_code": "POST /search-code"
         }
     }
@@ -589,7 +769,14 @@ async def activate(request: ActivationRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Signing failed")
 
-    return {"authorized": True, "payload": payload_b64, "signature": signature_b64}
+    session = _issue_session_token(hwid)
+    return {
+        "authorized": True,
+        "payload": payload_b64,
+        "signature": signature_b64,
+        "sessionToken": session["token"],
+        "sessionExpiresAt": session["exp"],
+    }
 
 
 
@@ -605,7 +792,12 @@ async def validate(request: ValidateRequest):
     if hwid in authorized:
         # Update last validated timestamp
         db_update_last_validated(hwid)
-        return {"authorized": True}
+        session = _issue_session_token(hwid)
+        return {
+            "authorized": True,
+            "sessionToken": session["token"],
+            "sessionExpiresAt": session["exp"],
+        }
 
     if hwid not in pending:
         db_add_pending(hwid)
@@ -629,7 +821,15 @@ async def validate(request: ValidateRequest):
     return {"authorized": False}
 
 @app.post("/aggregation")
-async def aggregation(request: AggregationRequest):
+async def aggregation(
+    request: AggregationRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
+):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
     """Отправка отчёта об агрегации"""
     
     # Декодируем documentBody из base64
@@ -675,7 +875,15 @@ async def aggregation(request: AggregationRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/utilisation")
-async def utilisation(request: UtilisationRequest):
+async def utilisation(
+    request: UtilisationRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
+):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
     """Отправка отчёта о нанесении"""
     
     # Формируем запрос к ASL API
@@ -727,12 +935,18 @@ async def utilisation(request: UtilisationRequest):
 
 @app.post("/correction-km")
 async def correction_km(
+    http_request: Request,
     documentBody: UploadFile = File(...),
     productionDatetime: str = Form(None),
     expirationDatetime: str = Form(None),
     manufacturerCountry: str = Form(None),
     seriesNumber: str = Form(None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
 ):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
     """
     Массовая корректировка КМ через xTrace Open API.
     Реализовано по документации:
@@ -843,8 +1057,93 @@ async def correction_km(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/correction-status")
+async def correction_status(
+    request: DocumentStatusRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
+):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
+    """
+    Получить статус обработки документа корректировки по document_id
+    (аналог карточки операции в xTrace).
+    """
+    doc_id = (request.document_id or "").strip()
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="document_id is required")
+
+    headers = {
+        "Authorization": f"Bearer {ASL_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    try:
+        # Основной endpoint из web-клиента xTrace.
+        candidates = [
+            f"{ASL_API_URL}/public/api/v1/doc/storage/docs/{doc_id}",
+            f"{ASL_API_URL}/api/doc/storage/docs/{doc_id}",
+        ]
+
+        attempts = []
+        response = None
+        for url in candidates:
+            r = requests.get(url, headers=headers, timeout=30)
+            attempts.append({"url": url, "status_code": r.status_code})
+            if r.status_code == 405:
+                continue
+            response = r
+            break
+
+        if response is None:
+            return {"status_code": 405, "body": "Not Allowed", "attempts": attempts}
+
+        body: Any = response.text
+        try:
+            body = response.json()
+        except Exception:
+            pass
+
+        # Пробуем взять ошибки (до 5) — если endpoint доступен.
+        errors_preview = None
+        try:
+            err_resp = requests.get(
+                f"{ASL_API_URL}/public/api/v1/doc/storage/errors/{doc_id}",
+                headers=headers,
+                params={"propertyName": "code", "lastIndex": 0, "limit": 5},
+                timeout=30
+            )
+            if err_resp.status_code == 200:
+                try:
+                    errors_preview = err_resp.json()
+                except Exception:
+                    errors_preview = err_resp.text
+        except Exception:
+            pass
+
+        return {
+            "status_code": response.status_code,
+            "body": body,
+            "errors_preview": errors_preview,
+            "attempts": attempts,
+        }
+    except requests.Timeout:
+        raise HTTPException(status_code=504, detail="Timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/search-code")
-async def search_code(request: SearchCodeRequest):
+async def search_code(
+    request: SearchCodeRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
+):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
     """
     Поиск информации о коде маркировки или SSCC
     Возвращает детальную информацию включая:
@@ -931,7 +1230,15 @@ async def search_code(request: SearchCodeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get-product-info")
-async def get_product_info(request: ProductInfoRequest):
+async def get_product_info(
+    request: ProductInfoRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
+):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
     """
     Получение информации о товаре по productId из реестра
     Возвращает название товара и другие данные
@@ -962,7 +1269,15 @@ async def get_product_info(request: ProductInfoRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/order-codes")
-async def order_codes(request: OrderCodesRequest):
+async def order_codes(
+    request: OrderCodesRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    x_client_hwid: Optional[str] = Header(default=None, alias="X-Client-HWID"),
+    x_client_ts: Optional[str] = Header(default=None, alias="X-Client-Ts"),
+    x_client_nonce: Optional[str] = Header(default=None, alias="X-Client-Nonce"),
+):
+    _enforce_critical_access(http_request, x_session_token, x_client_hwid, x_client_ts, x_client_nonce)
     """
     Получить все КМ из подзаказа эмиссии в порядке выдачи.
     Порядок совпадает с порядком в CSV/PDF файлах.
