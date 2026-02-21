@@ -13,6 +13,9 @@ import uuid
 import csv
 import io
 import time
+import threading
+import ssl
+import socket
 import hmac
 import hashlib
 import secrets
@@ -84,6 +87,18 @@ if not SESSION_SECRET:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
+TLS_MONITOR_ENABLED = os.getenv("TLS_MONITOR_ENABLED", "false").lower() == "true"
+TLS_MONITOR_HOST = os.getenv("TLS_MONITOR_HOST", "asl-proxy.onrender.com")
+TLS_MONITOR_PORT = int(os.getenv("TLS_MONITOR_PORT", "443"))
+TLS_MONITOR_INTERVAL_SEC = int(os.getenv("TLS_MONITOR_INTERVAL_SEC", "21600"))  # 6 hours
+TLS_WARN_DAYS = int(os.getenv("TLS_WARN_DAYS", "20"))
+TLS_EXPECTED_PINS_RAW = os.getenv("TLS_EXPECTED_PINS", "")
+TLS_EXPECTED_PINS = {
+    x.strip().upper()
+    for x in TLS_EXPECTED_PINS_RAW.split(",")
+    if x.strip()
+}
+
 # PostgreSQL - теперь с Neon.tech!
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -94,6 +109,7 @@ db_pool = None
 nonce_cache: Dict[str, int] = {}
 rate_limit_hwid: Dict[str, List[float]] = {}
 rate_limit_ip: Dict[str, List[float]] = {}
+tls_monitor_state: Dict[str, Any] = {}
 
 def init_db_pool():
     """Initialize PostgreSQL connection pool"""
@@ -394,6 +410,130 @@ def send_telegram(message: str, buttons: List[List[Dict]] = None):
     except Exception as e:
         print(f"[TG] send exception: {e}")
 
+
+def _sha256_colon(der_bytes: bytes) -> str:
+    hexv = hashlib.sha256(der_bytes).hexdigest().upper()
+    return ":".join(hexv[i:i + 2] for i in range(0, len(hexv), 2))
+
+
+def _fetch_tls_info(host: str, port: int) -> Dict[str, Any]:
+    ctx = ssl.create_default_context()
+    pins_seen: List[str] = []
+    cert: Dict[str, Any] = {}
+
+    with socket.create_connection((host, port), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
+            cert = tls_sock.getpeercert()
+            leaf_der = tls_sock.getpeercert(binary_form=True)
+            if leaf_der:
+                pins_seen.append(_sha256_colon(leaf_der))
+
+            chain = None
+            if hasattr(tls_sock, "get_verified_chain"):
+                chain = tls_sock.get_verified_chain()
+            elif hasattr(tls_sock, "getpeercertchain"):
+                chain = tls_sock.getpeercertchain()
+
+            if chain:
+                for c in chain:
+                    try:
+                        der = c if isinstance(c, bytes) else c.public_bytes()
+                        fp = _sha256_colon(der)
+                        if fp not in pins_seen:
+                            pins_seen.append(fp)
+                    except Exception:
+                        continue
+
+    not_after_raw = cert.get("notAfter", "")
+    not_after_iso = ""
+    days_left = None
+    if not_after_raw:
+        try:
+            not_after_dt = datetime.strptime(not_after_raw, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+            not_after_iso = not_after_dt.isoformat()
+            days_left = (not_after_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+        except Exception:
+            pass
+
+    return {
+        "host": host,
+        "port": port,
+        "leaf_pin": pins_seen[0] if pins_seen else "",
+        "pins": pins_seen,
+        "issuer": str(cert.get("issuer", "")),
+        "subject": str(cert.get("subject", "")),
+        "not_after": not_after_iso,
+        "days_left": days_left,
+    }
+
+
+def _send_tls_alert(title: str, info: Dict[str, Any], extra: Optional[str] = None):
+    lines = [
+        f"<b>{title}</b>",
+        f"Host: <code>{info.get('host')}:{info.get('port')}</code>",
+        f"Leaf pin: <code>{info.get('leaf_pin', '')}</code>",
+        f"NotAfter: <code>{info.get('not_after', '')}</code>",
+    ]
+    if info.get("days_left") is not None:
+        lines.append(f"Days left: <code>{info['days_left']:.2f}</code>")
+    if extra:
+        lines.append(extra)
+    send_telegram("\n".join(lines))
+
+
+def _tls_monitor_loop():
+    print("[TLS] monitor thread started")
+    while True:
+        try:
+            info = _fetch_tls_info(TLS_MONITOR_HOST, TLS_MONITOR_PORT)
+
+            prev_leaf = str(tls_monitor_state.get("leaf_pin", ""))
+            prev_not_after = str(tls_monitor_state.get("not_after", ""))
+
+            if prev_leaf and prev_leaf != info.get("leaf_pin", ""):
+                _send_tls_alert(
+                    "TLS CERT CHANGED",
+                    info,
+                    extra=f"Previous leaf pin: <code>{prev_leaf}</code>",
+                )
+
+            if prev_not_after and prev_not_after != info.get("not_after", ""):
+                _send_tls_alert(
+                    "TLS EXPIRY CHANGED",
+                    info,
+                    extra=f"Previous NotAfter: <code>{prev_not_after}</code>",
+                )
+
+            expiry_alert_key = f"expiry:{info.get('not_after','')}"
+            if info.get("days_left") is not None and info["days_left"] <= TLS_WARN_DAYS and tls_monitor_state.get("last_expiry_alert") != expiry_alert_key:
+                _send_tls_alert(
+                    "TLS EXPIRES SOON",
+                    info,
+                    extra=f"Threshold: <code>{TLS_WARN_DAYS}</code> days",
+                )
+                tls_monitor_state["last_expiry_alert"] = expiry_alert_key
+
+            pin_alert_key = f"pin:{info.get('leaf_pin','')}"
+            if TLS_EXPECTED_PINS and str(info.get("leaf_pin", "")).upper() not in TLS_EXPECTED_PINS and tls_monitor_state.get("last_pin_alert") != pin_alert_key:
+                _send_tls_alert(
+                    "TLS PIN MISMATCH",
+                    info,
+                    extra=f"Expected one of: <code>{', '.join(sorted(TLS_EXPECTED_PINS))}</code>",
+                )
+                tls_monitor_state["last_pin_alert"] = pin_alert_key
+
+            tls_monitor_state["leaf_pin"] = info.get("leaf_pin", "")
+            tls_monitor_state["not_after"] = info.get("not_after", "")
+            tls_monitor_state["last_ok"] = datetime.now(timezone.utc).isoformat()
+        except Exception as e:
+            send_telegram(
+                f"<b>TLS monitor error</b>\n"
+                f"Host: <code>{TLS_MONITOR_HOST}:{TLS_MONITOR_PORT}</code>\n"
+                f"Error: <code>{str(e)}</code>"
+            )
+
+        time.sleep(max(60, TLS_MONITOR_INTERVAL_SEC))
+
 # ------------------------------------------------------------------
 # FastAPI init
 # ------------------------------------------------------------------
@@ -410,6 +550,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     init_db_pool()
+    if TLS_MONITOR_ENABLED:
+        print(f"[TLS] monitor enabled for {TLS_MONITOR_HOST}:{TLS_MONITOR_PORT}, interval={TLS_MONITOR_INTERVAL_SEC}s")
+        threading.Thread(target=_tls_monitor_loop, daemon=True).start()
 
 # ------------------------------------------------------------------
 # Models
