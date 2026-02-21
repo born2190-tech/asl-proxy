@@ -739,6 +739,7 @@ async def correction_km(
 
     headers = {
         "Authorization": f"Bearer {ASL_API_KEY}",
+        "Accept": "application/json",
     }
 
     try:
@@ -760,23 +761,84 @@ async def correction_km(
         if seriesNumber:
             data["seriesNumber"] = seriesNumber
 
-        response = requests.post(
-            f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv",
-            files=files,
-            data=data,
-            headers=headers,
-            timeout=60
-        )
+        # NOTE:
+        # В разных контурах ASL/xTrace для корректировки CSV встречаются
+        # разные комбинации endpoint/method. Если первый вариант даёт 405,
+        # пробуем резервные варианты.
+        candidates = [
+            ("POST", f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv"),
+            ("PUT",  f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv"),
+            ("POST", f"{ASL_API_URL}/public/api/v1/warehouse/correction/create-draft/csv"),
+            ("PUT",  f"{ASL_API_URL}/public/api/v1/warehouse/correction/create-draft/csv"),
+        ]
 
-        body = response.text
-        try:
-            body = response.json()
-        except Exception:
-            pass
+        attempts = []
+        last_response = None
+
+        for method, url in candidates:
+            try:
+                if method == "POST":
+                    response = requests.post(
+                        url,
+                        files=files,
+                        data=data,
+                        headers=headers,
+                        timeout=60
+                    )
+                else:
+                    response = requests.put(
+                        url,
+                        files=files,
+                        data=data,
+                        headers=headers,
+                        timeout=60
+                    )
+            except Exception as req_err:
+                attempts.append({
+                    "method": method,
+                    "url": url,
+                    "status_code": "request_error",
+                    "error": str(req_err),
+                })
+                continue
+
+            last_response = response
+            attempts.append({
+                "method": method,
+                "url": url,
+                "status_code": response.status_code,
+            })
+
+            # Успех/бизнес-ошибка ASL (не 405) возвращаем сразу.
+            if response.status_code != 405:
+                body = response.text
+                try:
+                    body = response.json()
+                except Exception:
+                    pass
+                return {
+                    "status_code": response.status_code,
+                    "body": body,
+                    "attempts": attempts,
+                }
+
+        # Если все варианты дали 405 или request_error — возвращаем диагностику.
+        if last_response is not None:
+            body = last_response.text
+            try:
+                body = last_response.json()
+            except Exception:
+                pass
+            return {
+                "status_code": last_response.status_code,
+                "body": body,
+                "attempts": attempts,
+            }
 
         return {
-            "status_code": response.status_code,
-            "body": body
+            "status_code": 500,
+            "body": "No upstream response",
+            "attempts": attempts,
         }
 
     except requests.Timeout:
