@@ -9,6 +9,9 @@ import json
 import base64
 import traceback
 import uuid
+import csv
+import io
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List
 from typing import Optional
 
@@ -732,7 +735,10 @@ async def correction_km(
 ):
     """
     Массовая корректировка КМ через xTrace Open API.
-    Форвардит CSV (multipart/form-data) как поле documentBody.
+    Реализовано по документации:
+    POST /public/api/v1/doc/correction
+    body: { "documentBody": "<base64(json)>" }
+    signature: не используется (по требованию клиента).
     """
     if not documentBody:
         raise HTTPException(status_code=400, detail="documentBody file is required")
@@ -740,105 +746,96 @@ async def correction_km(
     headers = {
         "Authorization": f"Bearer {ASL_API_KEY}",
         "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
     try:
         content = await documentBody.read()
-        files = {
-            "documentBody": (
-                documentBody.filename or "correction.csv",
-                content,
-                documentBody.content_type or "text/csv"
-            )
-        }
-        data = {}
-        if productionDatetime:
-            data["productionDatetime"] = productionDatetime
-        if expirationDatetime:
-            data["expirationDatetime"] = expirationDatetime
-        if manufacturerCountry:
-            data["manufacturerCountry"] = manufacturerCountry
-        if seriesNumber:
-            data["seriesNumber"] = seriesNumber
+        decoded = content.decode("utf-8-sig", errors="replace")
 
-        # NOTE:
-        # В разных контурах ASL/xTrace для корректировки CSV встречаются
-        # разные комбинации endpoint/method. Если первый вариант даёт 405,
-        # пробуем резервные варианты.
-        candidates = [
-            ("POST", f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv"),
-            ("PUT",  f"{ASL_API_URL}/api/v1/warehouse/correction/create-draft/csv"),
-            ("POST", f"{ASL_API_URL}/public/api/v1/warehouse/correction/create-draft/csv"),
-            ("PUT",  f"{ASL_API_URL}/public/api/v1/warehouse/correction/create-draft/csv"),
-        ]
-
-        attempts = []
-        last_response = None
-
-        for method, url in candidates:
-            try:
-                if method == "POST":
-                    response = requests.post(
-                        url,
-                        files=files,
-                        data=data,
-                        headers=headers,
-                        timeout=60
-                    )
-                else:
-                    response = requests.put(
-                        url,
-                        files=files,
-                        data=data,
-                        headers=headers,
-                        timeout=60
-                    )
-            except Exception as req_err:
-                attempts.append({
-                    "method": method,
-                    "url": url,
-                    "status_code": "request_error",
-                    "error": str(req_err),
-                })
+        # Из CSV берём коды построчно.
+        codes: List[str] = []
+        reader = csv.reader(io.StringIO(decoded))
+        for row in reader:
+            if not row:
                 continue
+            code = (row[0] or "").strip()
+            if code:
+                codes.append(code)
 
-            last_response = response
-            attempts.append({
-                "method": method,
-                "url": url,
-                "status_code": response.status_code,
-            })
-
-            # Успех/бизнес-ошибка ASL (не 405) возвращаем сразу.
-            if response.status_code != 405:
-                body = response.text
-                try:
-                    body = response.json()
-                except Exception:
-                    pass
-                return {
-                    "status_code": response.status_code,
-                    "body": body,
-                    "attempts": attempts,
-                }
-
-        # Если все варианты дали 405 или request_error — возвращаем диагностику.
-        if last_response is not None:
-            body = last_response.text
-            try:
-                body = last_response.json()
-            except Exception:
-                pass
+        if not codes:
             return {
-                "status_code": last_response.status_code,
-                "body": body,
-                "attempts": attempts,
+                "status_code": 400,
+                "body": {"message": "CSV is empty or contains no codes"},
             }
 
+        # Удаляем дубликаты с сохранением порядка.
+        uniq_codes = list(dict.fromkeys(codes))
+
+        updated_fields: Dict[str, Any] = {}
+        if productionDatetime:
+            updated_fields["productionDatetime"] = productionDatetime.strip()
+        if expirationDatetime:
+            updated_fields["expirationDatetime"] = expirationDatetime.strip()
+        if manufacturerCountry:
+            updated_fields["manufacturerCountry"] = manufacturerCountry.strip()
+        if seriesNumber:
+            updated_fields["seriesNumber"] = seriesNumber.strip()
+
+        if not updated_fields:
+            return {
+                "status_code": 400,
+                "body": {"message": "At least one correction field is required"},
+            }
+
+        # businessDatetime обязателен по Open API.
+        tz_uz = timezone(timedelta(hours=5))
+        business_dt = datetime.now(tz_uz).strftime("%Y-%m-%dT%H:%M:%S%z")
+        business_dt = business_dt[:-2] + ":" + business_dt[-2:]  # +0500 -> +05:00
+
+        payload_obj = {
+            "businessDatetime": business_dt,
+            "codes": uniq_codes,
+            "updatedFields": updated_fields,
+        }
+
+        def _sort_obj(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {k: _sort_obj(obj[k]) for k in sorted(obj.keys())}
+            if isinstance(obj, list):
+                return [_sort_obj(x) for x in obj]
+            return obj
+
+        sorted_payload = _sort_obj(payload_obj)
+        json_str = json.dumps(sorted_payload, ensure_ascii=False, separators=(",", ":"))
+        document_body_b64 = base64.b64encode(json_str.encode("utf-8")).decode("ascii")
+
+        upstream_body = {
+            "documentBody": document_body_b64
+            # signature не передаём по требованию клиента
+        }
+
+        response = requests.post(
+            f"{ASL_API_URL}/public/api/v1/doc/correction",
+            json=upstream_body,
+            headers=headers,
+            timeout=60
+        )
+
+        body = response.text
+        try:
+            body = response.json()
+        except Exception:
+            pass
+
         return {
-            "status_code": 500,
-            "body": "No upstream response",
-            "attempts": attempts,
+            "status_code": response.status_code,
+            "body": body,
+            "meta": {
+                "codesCount": len(uniq_codes),
+                "updatedFieldsKeys": list(updated_fields.keys()),
+                "endpoint": "/public/api/v1/doc/correction",
+            }
         }
 
     except requests.Timeout:
